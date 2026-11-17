@@ -1,0 +1,78 @@
+name: 1 - Login + Backup to Mega
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: "Direct URL to the APK"
+        required: true
+        type: string
+        default: "https://github.com/bluesky-social/social-app/releases/download/1.136.0/Bluesky-1.136.0.apk"
+      package_name:
+        description: "Package name (leave empty for auto-detect)"
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  login-and-backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Install chafa (screenshot preview in logs)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq chafa
+
+      - name: Login, backup and upload to Mega
+        uses: reactivecircus/android-emulator-runner@v2
+        env:
+          MODE: login
+          APK_URL: ${{ inputs.apk_url }}
+          PACKAGE_NAME: ${{ inputs.package_name }}
+          DO_LOGIN: "1"
+          MAKE_BACKUP: "1"
+          MEGA_UPLOAD: "1"
+          BSKY_IDENTIFIER: ${{ secrets.BSKY_IDENTIFIER }}
+          BSKY_PASSWORD: ${{ secrets.BSKY_PASSWORD }}
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+          RCLONE_CONF_CONTENT: ${{ secrets.RCLONE_CONF }}
+          MEGA_FOLDER: bluesky-android-backup
+          MEGA_FILE: session.tgz.enc
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          force-avd-creation: true
+          emulator-boot-timeout: 600
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-metrics
+          disable-animations: true
+          script: bash scripts/install-and-screenshot.sh
+
+      - name: Upload screenshots and logs
+        id: upload
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: login-screenshots
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Show artifact link
+        if: always()
+        run: |
+          echo "Screenshots: ${{ steps.upload.outputs.artifact-url }}"
+          {
+            echo "### Screenshots"
+            echo "[Download login-screenshots](${{ steps.upload.outputs.artifact-url }})"
+          } >> "$GITHUB_STEP_SUMMARY"
