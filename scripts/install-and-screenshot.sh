@@ -106,13 +106,39 @@ settle_device() {
 # =====================================================================
 #  Mega.nz via rclone
 # =====================================================================
+
+# True if this rclone build knows the mega backend
+rclone_has_mega() {
+  local out
+  out="$(rclone help backends 2>/dev/null || true)"
+  grep -qiE '(^|[[:space:]])mega([[:space:]]|$)' <<< "$out"
+}
+
+# The Ubuntu/Debian rclone package has no mega backend, so use the official build
+install_official_rclone() {
+  log "installing the official rclone build (the distro package has no mega backend)..."
+  local tmp; tmp="$(mktemp -d)"
+  if curl -fsSL -o "$tmp/rclone.zip" https://downloads.rclone.org/rclone-current-linux-amd64.zip \
+     && unzip -q "$tmp/rclone.zip" -d "$tmp"; then
+    sudo install -m 0755 "$tmp"/rclone-*-linux-amd64/rclone /usr/local/bin/rclone
+  else
+    log "direct download failed, trying the rclone install script"
+    curl -fsSL https://rclone.org/install.sh | sudo bash >/dev/null 2>&1 || true
+  fi
+  rm -rf "$tmp"
+  hash -r
+}
+
 setup_rclone() {
-  if ! command -v rclone >/dev/null 2>&1; then
-    log "installing rclone..."
-    sudo apt-get install -y -qq rclone >/dev/null 2>&1 \
-      || { curl -fsSL https://rclone.org/install.sh | sudo bash >/dev/null 2>&1; }
+  if ! command -v rclone >/dev/null 2>&1 || ! rclone_has_mega; then
+    install_official_rclone
   fi
   command -v rclone >/dev/null 2>&1 || { log "rclone is not available"; return 1; }
+  if ! rclone_has_mega; then
+    log "this rclone build still has no mega backend: $(rclone version 2>/dev/null | head -1)"
+    return 1
+  fi
+  log "rclone ready: $(rclone version 2>/dev/null | head -1)"
 
   if [[ ! -s "$RCLONE_CFG" ]]; then
     if [[ -z "$RCLONE_CONF_CONTENT" ]]; then
