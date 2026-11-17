@@ -1,98 +1,48 @@
 #!/usr/bin/env bash
-# Download APK -> Install -> Launch -> Take screenshots
-# Inputs come from env vars set by the workflow:
-#   APK_URL       (required) direct link to an .apk
-#   PACKAGE_NAME  (optional) auto-detected if empty
-#   SPOOF_DEVICE  (optional) 1 = try device identity spoof (off by default)
-set -euo pipefail
+# Download APK -> (optional spoof) -> Install -> Launch -> Screenshots
+# Env: APK_URL (required), PACKAGE_NAME (optional), SPOOF_DEVICE (1 = experimental spoof)
+set -uo pipefail
 
 ROOT="${GITHUB_WORKSPACE:-$(pwd)}"
 ARTIFACTS="${ROOT}/artifacts"
 mkdir -p "$ARTIFACTS"
+exec > >(tee -a "$ARTIFACTS/run.log") 2>&1
 
 APK_URL="${APK_URL:-}"
 PACKAGE_NAME="${PACKAGE_NAME:-}"
 SPOOF_DEVICE="${SPOOF_DEVICE:-0}"
 APK_FILE="$ARTIFACTS/app.apk"
-HAVE_ROOT=0
 
 log() { printf '[install] %s\n' "$*"; }
+adb_sh() { adb shell "$@" | tr -d '\r'; }
 
-# Always save a final screenshot + logcat, even if the script fails
-on_exit() {
+screenshot() {
+  local f="$ARTIFACTS/$1"
+  adb exec-out screencap -p > "$f" 2>/dev/null
+  if [[ -s "$f" ]]; then log "screenshot saved: $1 ($(stat -c%s "$f") bytes)"
+  else log "screenshot FAILED: $1"; rm -f "$f"; fi
+}
+
+finish() {
   local code=$?
-  log "exit code: $code, saving debug output"
-  adb exec-out screencap -p > "$ARTIFACTS/99-final-state.png" 2>/dev/null || true
-  adb logcat -d > "$ARTIFACTS/logcat.txt" 2>/dev/null || true
+  log "script exiting with code $code"
+  screenshot "99-final-state.png"
+  adb logcat -d > "$ARTIFACTS/logcat.txt" 2>/dev/null
+  ls -la "$ARTIFACTS"
   exit "$code"
 }
-trap on_exit EXIT
-
-[[ -n "$APK_URL" ]] || { log "APK_URL not set"; exit 1; }
-
-adb_sh() { adb shell "$@" | tr -d '\r'; }
+trap finish EXIT
 
 wait_for_boot() {
   adb wait-for-device
   local i=0
   while (( i < 180 )); do
     if [[ "$(adb_sh getprop sys.boot_completed 2>/dev/null || true)" == "1" ]]; then
-      sleep 5
-      return 0
+      sleep 5; return 0
     fi
-    sleep 2
-    i=$((i+1))
+    sleep 2; i=$((i+1))
   done
-  log "timed out waiting for boot"
-  return 1
-}
-
-uid_is_root() { [[ "$(adb_sh id -u 2>/dev/null || true)" == "0" ]]; }
-
-ensure_root() {
-  for _ in 1 2 3 4 5; do
-    if uid_is_root; then log "root available"; return 0; fi
-    adb root >/dev/null 2>&1 || true
-    sleep 3
-    adb wait-for-device
-  done
-  if uid_is_root; then return 0; fi
-  log "no root"
-  return 1
-}
-
-# ---------- Random device profile (optional spoof) ----------
-pick_android_device() {
-  local devices=(
-    "samsung|SM-S928B|e3sxxx|e3s|Galaxy S24 Ultra|samsung/e3sxxx/e3s:14/UP1A.231005.007/S928BXXS3AXKF:user/release-keys|14|420"
-    "samsung|SM-S911B|dm1qxxx|dm1q|Galaxy S23|samsung/dm1qxxx/dm1q:14/UP1A.231005.007/S911BXXS3AXK1:user/release-keys|14|420"
-    "google|Pixel 8 Pro|husky|husky|Pixel 8 Pro|google/husky/husky:14/AP2A.240905.003/12234114:user/release-keys|14|420"
-    "google|Pixel 7|panther|panther|Pixel 7|google/panther/panther:14/AP2A.240905.003/12234114:user/release-keys|14|420"
-    "OnePlus|CPH2449|OPD2101|OPD2101|OnePlus 11|OnePlus/CPH2449/OPD2101:14/UKQ1.230924.001/R.19a:user/release-keys|14|480"
-  )
-  local choice="${devices[RANDOM % ${#devices[@]}]}"
-  IFS='|' read -r BRAND MODEL NAME DEVICE MARKETNAME FINGERPRINT SDK DENSITY <<< "$choice"
-  log "Selected device: $MARKETNAME ($MODEL)"
-}
-
-write_device_identity() {
-  local tmp; tmp="$(mktemp)"
-  cat > "$tmp" <<PROP
-ro.product.brand=${BRAND}
-ro.product.manufacturer=${BRAND}
-ro.product.model=${MODEL}
-ro.product.name=${NAME}
-ro.product.device=${DEVICE}
-ro.product.marketname=${MARKETNAME}
-ro.build.fingerprint=${FINGERPRINT}
-ro.build.type=user
-ro.build.tags=release-keys
-ro.sf.lcd_density=${DENSITY}
-PROP
-  adb push "$tmp" /data/local.prop >/dev/null
-  adb_sh chmod 644 /data/local.prop || true
-  rm -f "$tmp"
-  log "pushed device identity -> $MARKETNAME (note: ro.* props usually stay unchanged on this image)"
+  log "timed out waiting for boot"; return 1
 }
 
 settle_device() {
@@ -104,100 +54,112 @@ settle_device() {
   adb shell wm dismiss-keyguard >/dev/null 2>&1 || true
 }
 
-screenshot() {
-  adb exec-out screencap -p > "${ARTIFACTS}/$1"
-  log "screenshot -> ${ARTIFACTS}/$1"
-}
+# ---------- Experimental device spoof ----------
+# Edits build.prop files on the (userdebug) emulator image, then reboots.
+spoof_device_identity() {
+  local devices=(
+    "samsung|SM-S928B|e3sxxx|e3s|Galaxy S24 Ultra|samsung/e3sxxx/e3s:14/UP1A.231005.007/S928BXXS3AXKF:user/release-keys"
+    "samsung|SM-S911B|dm1qxxx|dm1q|Galaxy S23|samsung/dm1qxxx/dm1q:14/UP1A.231005.007/S911BXXS3AXK1:user/release-keys"
+    "google|Pixel 8 Pro|husky|husky|Pixel 8 Pro|google/husky/husky:14/AP2A.240905.003/12234114:user/release-keys"
+    "google|Pixel 7|panther|panther|Pixel 7|google/panther/panther:14/AP2A.240905.003/12234114:user/release-keys"
+    "OnePlus|CPH2449|OPD2101|OPD2101|OnePlus 11|OnePlus/CPH2449/OPD2101:14/UKQ1.230924.001/R.19a:user/release-keys"
+  )
+  local choice="${devices[RANDOM % ${#devices[@]}]}"
+  local BRAND MODEL NAME DEVICE MARKETNAME FINGERPRINT
+  IFS='|' read -r BRAND MODEL NAME DEVICE MARKETNAME FINGERPRINT <<< "$choice"
+  log "Spoofing as: $MARKETNAME ($MODEL)"
 
-third_party_packages() {
-  adb shell pm list packages -3 | tr -d '\r' | sed 's/^package://' | sort
+  adb root >/dev/null 2>&1; sleep 2; adb wait-for-device
+  log "disable-verity: $(adb disable-verity 2>&1 | tr '\n' ' ')"
+  adb reboot; wait_for_boot
+  adb root >/dev/null 2>&1; sleep 2; adb wait-for-device
+  log "remount: $(adb remount 2>&1 | tr '\n' ' ')"
+
+  local tmp; tmp="$(mktemp -d)"
+  local part f
+  for part in system vendor product system_ext; do
+    f="/$part/build.prop"
+    adb shell "[ -f $f ]" 2>/dev/null || continue
+    adb pull "$f" "$tmp/$part.prop" >/dev/null 2>&1 || { log "cannot pull $f"; continue; }
+    sed -i -E \
+      -e "s|^(ro\.product\.([a-z_]+\.)?brand)=.*|\1=${BRAND}|" \
+      -e "s|^(ro\.product\.([a-z_]+\.)?manufacturer)=.*|\1=${BRAND}|" \
+      -e "s|^(ro\.product\.([a-z_]+\.)?model)=.*|\1=${MODEL}|" \
+      -e "s|^(ro\.product\.([a-z_]+\.)?name)=.*|\1=${NAME}|" \
+      -e "s|^(ro\.product\.([a-z_]+\.)?device)=.*|\1=${DEVICE}|" \
+      -e "s|^(ro\.product\.([a-z_]+\.)?marketname)=.*|\1=${MARKETNAME}|" \
+      -e "s|^(ro\.([a-z_]+\.)?build\.fingerprint)=.*|\1=${FINGERPRINT}|" \
+      "$tmp/$part.prop"
+    if adb push "$tmp/$part.prop" "$f" >/dev/null 2>&1; then log "patched $f"
+    else log "could not write $f (read-only?)"; fi
+  done
+  rm -rf "$tmp"
+
+  adb reboot; wait_for_boot
+  log "spoof result -> model: $(adb_sh getprop ro.product.model) | brand: $(adb_sh getprop ro.product.brand) | fingerprint: $(adb_sh getprop ro.build.fingerprint)"
 }
 
 # ===================== MAIN =====================
+log "device:"; adb devices -l
 
-# ---------- 1. Download APK first (fail fast on a bad URL) ----------
-log "Downloading APK from $APK_URL"
-curl -L --fail --retry 3 --connect-timeout 20 -o "$APK_FILE" "$APK_URL"
+# 1. Download first (fail fast on a bad URL)
+[[ -n "$APK_URL" ]] || { log "APK_URL is empty"; exit 1; }
+log "Downloading $APK_URL"
+curl -L --fail --retry 3 --connect-timeout 20 -o "$APK_FILE" "$APK_URL" \
+  || { log "ERROR: download failed"; exit 1; }
 ls -lh "$APK_FILE"
-
-# An APK is a zip file and must start with "PK"
 if [[ "$(head -c 2 "$APK_FILE")" != "PK" ]]; then
-  log "ERROR: downloaded file is not an APK (probably an HTML page). Use a DIRECT .apk link."
-  head -c 300 "$APK_FILE" || true
-  echo
-  exit 1
+  log "ERROR: not an APK (HTML page?):"; head -c 300 "$APK_FILE"; echo; exit 1
 fi
 
-# ---------- 2. Boot / root / settle ----------
-log "waiting for device..."
+# 2. Boot + settle
 wait_for_boot
-if ensure_root; then HAVE_ROOT=1; fi
 settle_device
+screenshot "00-home-screen.png"
 
-# ---------- 3. Optional device spoof ----------
+# 3. Optional spoof
 if [[ "$SPOOF_DEVICE" == "1" ]]; then
-  pick_android_device
-  if [[ "$HAVE_ROOT" == "1" ]]; then
-    write_device_identity
-    log "rebooting to apply identity..."
-    adb reboot
-    wait_for_boot
-    if ensure_root; then HAVE_ROOT=1; else HAVE_ROOT=0; fi
-    settle_device
-  else
-    log "spoof requested but no root, skipping"
-  fi
+  spoof_device_identity || log "spoof step failed, continuing without it"
+  settle_device
+  screenshot "00b-after-spoof.png"
 else
-  log "device spoof disabled"
+  log "device spoof disabled (SPOOF_DEVICE=$SPOOF_DEVICE)"
 fi
 
-# ---------- 4. Install ----------
-BEFORE_PKGS="$(third_party_packages || true)"
+# 4. Package name
+if [[ -z "$PACKAGE_NAME" ]]; then
+  AAPT="$(ls "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/*/aapt 2>/dev/null | sort -V | tail -1)"
+  if [[ -n "$AAPT" ]]; then
+    PACKAGE_NAME="$("$AAPT" dump badging "$APK_FILE" 2>/dev/null | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -1)"
+  fi
+fi
+[[ -z "$PACKAGE_NAME" ]] && PACKAGE_NAME="xyz.blueskyweb.app"
+log "Package: $PACKAGE_NAME"
 
+# 5. Install
 log "Installing APK..."
 if ! adb install -r -t -g "$APK_FILE"; then
-  log "install failed, retrying with -d (allow downgrade)"
-  adb install -r -t -g -d "$APK_FILE"
+  log "retrying with -d"
+  adb install -r -t -g -d "$APK_FILE" || { log "ERROR: install failed"; exit 1; }
 fi
+adb shell pm list packages | grep -F "$PACKAGE_NAME" || { log "ERROR: package not installed"; exit 1; }
 sleep 2
 screenshot "01-after-install.png"
 
-# ---------- 5. Detect package ----------
-if [[ -z "$PACKAGE_NAME" ]]; then
-  log "Auto-detecting package name..."
-  AFTER_PKGS="$(third_party_packages || true)"
-  PACKAGE_NAME="$(comm -13 <(printf '%s\n' "$BEFORE_PKGS") <(printf '%s\n' "$AFTER_PKGS") | head -1 || true)"
-
-  # Fallback 1: aapt from build-tools
-  if [[ -z "$PACKAGE_NAME" ]]; then
-    AAPT="$(ls "${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"/build-tools/*/aapt 2>/dev/null | sort -V | tail -1 || true)"
-    if [[ -n "$AAPT" ]]; then
-      PACKAGE_NAME="$("$AAPT" dump badging "$APK_FILE" 2>/dev/null | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -1 || true)"
-    fi
-  fi
-
-  # Fallback 2: last third-party package
-  if [[ -z "$PACKAGE_NAME" ]]; then
-    PACKAGE_NAME="$(printf '%s\n' "$AFTER_PKGS" | tail -1)"
-  fi
-fi
-
-[[ -n "$PACKAGE_NAME" ]] || { log "could not determine package name"; exit 1; }
-log "Package: $PACKAGE_NAME"
-
-# ---------- 6. Launch ----------
+# 6. Launch
 log "Launching $PACKAGE_NAME ..."
+adb shell input keyevent KEYCODE_WAKEUP
+adb shell wm dismiss-keyguard
 if ! adb shell monkey -p "$PACKAGE_NAME" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1; then
-  ACTIVITY="$(adb shell cmd package resolve-activity --brief "$PACKAGE_NAME" | tr -d '\r' | tail -1)"
-  log "monkey failed, trying am start -n $ACTIVITY"
-  adb shell am start -n "$ACTIVITY"
+  ACT="$(adb_sh cmd package resolve-activity --brief "$PACKAGE_NAME" | tail -1)"
+  log "monkey failed, am start -n $ACT"
+  adb shell am start -n "$ACT"
 fi
 
-sleep 10   # give the app time to open
+sleep 10
 screenshot "02-after-launch.png"
-
-sleep 5
-screenshot "03-after-launch-15s.png"
+sleep 8
+screenshot "03-after-launch-18s.png"
+adb shell dumpsys window | grep -E "mCurrentFocus|mFocusedApp" | head -3
 
 log "Done!"
-ls -la "$ARTIFACTS"
