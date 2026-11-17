@@ -13,6 +13,11 @@ on:
         required: false
         type: string
         default: ""
+      do_login:
+        description: "Tap Sign in and log in using the BSKY_IDENTIFIER / BSKY_PASSWORD secrets"
+        required: false
+        type: boolean
+        default: true
       spoof_device:
         description: "Spoof a random device identity (experimental, adds reboots)"
         required: false
@@ -43,6 +48,9 @@ jobs:
           APK_URL: ${{ inputs.apk_url }}
           PACKAGE_NAME: ${{ inputs.package_name }}
           SPOOF_DEVICE: ${{ inputs.spoof_device && '1' || '0' }}
+          DO_LOGIN: ${{ inputs.do_login && '1' || '0' }}
+          BSKY_IDENTIFIER: ${{ secrets.BSKY_IDENTIFIER }}
+          BSKY_PASSWORD: ${{ secrets.BSKY_PASSWORD }}
         with:
           api-level: 34
           target: google_apis
@@ -55,6 +63,7 @@ jobs:
           script: bash scripts/install-and-screenshot.sh
 
       - name: Upload screenshots and logs
+        id: upload
         uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -64,3 +73,12 @@ jobs:
             !artifacts/app.apk
           if-no-files-found: warn
           retention-days: 14
+
+      - name: Show artifact link
+        if: always()
+        run: |
+          echo "Artifact URL: ${{ steps.upload.outputs.artifact-url }}"
+          {
+            echo "### Screenshots"
+            echo "[Download android-output](${{ steps.upload.outputs.artifact-url }})"
+          } >> "$GITHUB_STEP_SUMMARY"
