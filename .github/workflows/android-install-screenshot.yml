@@ -34,10 +34,8 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
-      - name: Debug repo layout
-        run: |
-          ls -la
-          find . -name "*.sh" -not -path "./.git/*"
+      - name: Install chafa (screenshot preview in logs)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq chafa
 
       - name: Start emulator and run script
         uses: reactivecircus/android-emulator-runner@v2
@@ -56,11 +54,13 @@ jobs:
           disable-animations: true
           script: bash scripts/install-and-screenshot.sh
 
-      - name: Upload everything
+      - name: Upload screenshots and logs
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: android-output
-          path: artifacts/
+          path: |
+            artifacts/
+            !artifacts/app.apk
           if-no-files-found: warn
           retention-days: 14
