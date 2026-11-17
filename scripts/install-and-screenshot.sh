@@ -42,7 +42,7 @@ APK_FILE="${RUNNER_TEMP:-/tmp}/app.apk"
 UI_XML="${RUNNER_TEMP:-/tmp}/ui.xml"
 SESSION_TMP="${RUNNER_TEMP:-/tmp}/session.tgz"
 
-# Buttons that close popups / dialogs
+# Buttons that close in-app popups / dialogs
 DISMISS_REGEX='^(Cancel|Not now|Maybe later|No thanks|Skip|Later|Dismiss|Got it)\b'
 
 log() { printf '[install] %s\n' "$*"; }
@@ -97,6 +97,7 @@ settle_device() {
   adb shell svc power stayon true >/dev/null 2>&1 || true
   adb shell settings put global stay_on_while_plugged_in 3 >/dev/null 2>&1 || true
   adb shell settings put secure lockscreen.disabled 1 >/dev/null 2>&1 || true
+  adb shell settings put global hide_error_dialogs 1 >/dev/null 2>&1 || true   # no "isn't responding" popups
   adb shell locksettings set-disabled true >/dev/null 2>&1 || true
   adb shell input keyevent KEYCODE_WAKEUP >/dev/null 2>&1 || true
   adb shell wm dismiss-keyguard >/dev/null 2>&1 || true
@@ -142,14 +143,12 @@ mega_upload() {
   rclone copyto "$BACKUP_FILE" "${MEGA_DIR}/session-${stamp}.tgz.enc" --retries 5 -q \
     || log "WARNING: dated copy was not uploaded"
 
-  # verify the upload really exists
   if [[ -z "$(rclone lsf "${MEGA_DIR}/${MEGA_FILE}" 2>/dev/null)" ]]; then
     log "mega upload could not be verified"; return 1
   fi
   log "MEGA UPLOAD OK: ${MEGA_FOLDER}/${MEGA_FILE} and session-${stamp}.tgz.enc"
   rclone lsl "$MEGA_DIR" 2>/dev/null | sed 's/^/[mega] /'
 
-  # keep only the newest N dated copies
   if [[ "$MEGA_KEEP" =~ ^[0-9]+$ ]]; then
     local old f
     old="$(rclone lsf "$MEGA_DIR" --include 'session-*.tgz.enc' 2>/dev/null | sort | head -n -"$MEGA_KEEP")"
@@ -233,6 +232,7 @@ tap_text() {
   adb shell input tap $xy
 }
 
+# tap_field <index> -> taps the Nth text input; returns 1 if it does not exist
 tap_field() {
   local xy="" i
   for i in 1 2 3 4; do
@@ -240,7 +240,7 @@ tap_field() {
     [[ -n "$xy" ]] && break
     sleep 2
   done
-  if [[ -z "$xy" ]]; then log "text field #$1 not found (typing into focused field)"; return 1; fi
+  if [[ -z "$xy" ]]; then log "text field #$1 not found"; return 1; fi
   log "tap text field #$1 at $xy"
   adb shell input tap $xy
 }
@@ -253,10 +253,50 @@ type_text() {
   adb shell "input text '$s'" >/dev/null 2>&1
 }
 
-# Close any popup / dialog (e.g. "Invite your friends" -> Cancel)
+# ---------- System dialogs ("Pixel Launcher isn't responding", crashes) ----------
+focus_line() { adb shell dumpsys window 2>/dev/null | grep -E 'mCurrentFocus' | head -1 | tr -d '\r'; }
+
+dismiss_system_dialogs() {
+  local i xy why n=0 focus
+  for ((i=0; i<6; i++)); do
+    xy=""; why=""
+    if ui_dump; then
+      if grep -qiE 'responding' "$UI_XML"; then
+        xy="$(ui_query text '^Wait$' 0 || true)"; why="not responding -> Wait"
+      elif grep -qiE 'keeps stopping|has stopped' "$UI_XML"; then
+        xy="$(ui_query text '^(Close app|OK)$' 0 || true)"; why="crash -> Close app"
+      fi
+    else
+      # uiautomator is too busy: detect the ANR window another way
+      focus="$(focus_line)"
+      if [[ "$focus" == *"Not Responding"* ]]; then
+        xy="320 1358"; why="not responding (fallback coordinates) -> Wait"
+      fi
+    fi
+    [[ -z "$xy" ]] && break
+    log "system dialog found ($why) at $xy"
+    adb shell input tap $xy
+    n=$((n+1))
+    sleep 3
+  done
+  (( n > 0 )) && log "handled $n system dialog(s)"
+  return 0
+}
+
+ensure_app_foreground() {
+  if ! focus_line | grep -q "$PACKAGE_NAME"; then
+    log "app is not in the foreground ($(focus_line)), relaunching"
+    launch_app
+    sleep 8
+    dismiss_system_dialogs
+  fi
+}
+
+# Close in-app popups / dialogs (e.g. "Invite your friends" -> Cancel)
 dismiss_popups() {
   local rounds="${1:-5}" i xy hit
   for ((i=0; i<rounds; i++)); do
+    dismiss_system_dialogs
     hit=0
     if ui_dump; then
       xy="$(ui_query text "$DISMISS_REGEX" 0 || true)"
@@ -321,7 +361,6 @@ backup_session() {
   log "encrypted backup created: backup/session.tgz.enc ($(stat -c%s "$BACKUP_FILE") bytes)"
 }
 
-# create the backup, then upload it to Mega
 backup_and_upload() {
   backup_session || return 1
   if [[ "$MEGA_UPLOAD" == "1" ]]; then
@@ -364,30 +403,50 @@ login_flow() {
     return 0
   fi
 
-  log "Login: tapping Sign in"
-  tap_text '^Sign in$' "540 2258" || true
-  sleep 4
+  dismiss_system_dialogs
+  ensure_app_foreground
+
+  # Open the sign-in form (2 attempts). Nothing is typed unless a text field exists.
+  local opened=0 attempt
+  for attempt in 1 2; do
+    log "Login: tapping Sign in (attempt $attempt)"
+    tap_text '^Sign in$' "540 2258" || true
+    sleep 4
+    dismiss_system_dialogs
+    if tap_field 0; then opened=1; break; fi
+    log "sign-in form not open yet"
+  done
   screenshot "04-signin-screen.png"
+  if [[ "$opened" != "1" ]]; then
+    log "ERROR: the sign-in form did not open, so nothing was typed. See screenshot 04."
+    return 1
+  fi
 
   log "Login: entering username/email"
-  tap_field 0 || true
   sleep 1
   type_text "$BSKY_IDENTIFIER"
   sleep 1
   screenshot "05-username-entered.png"
 
+  dismiss_system_dialogs
   log "Login: entering password (hidden in screenshot)"
-  tap_field 1 || true
+  if ! tap_field 1; then
+    log "ERROR: password field not found, stopping the login. See screenshot 05."
+    return 1
+  fi
   sleep 1
   type_text "$BSKY_PASSWORD"
   sleep 1
   screenshot "06-password-entered.png"
 
+  dismiss_system_dialogs
+  ensure_app_foreground
   log "Login: submitting"
   adb shell input keyevent 66    # ENTER
   sleep 3
   tap_text '^Next$' "" 1 || true
   sleep 12
+  dismiss_system_dialogs
   screenshot "07-after-login-12s.png"
 
   if ui_dump; then
@@ -407,7 +466,7 @@ login_flow() {
     log "LOGIN OK (feed is visible)"
     if [[ "$MAKE_BACKUP" == "1" ]]; then
       backup_and_upload || log "WARNING: backup was not created"
-      launch_app; sleep 6      # bring the app back so the final screenshot shows it
+      launch_app; sleep 6
     fi
   else
     log "WARNING: feed not detected, not creating a backup (so a good old backup is never replaced by a bad one)"
@@ -418,6 +477,7 @@ restore_flow() {
   log "Restore: starting the app once so its data folder exists"
   launch_app
   sleep 8
+  dismiss_system_dialogs
   adb shell am force-stop "$PACKAGE_NAME"
   sleep 1
 
@@ -425,6 +485,7 @@ restore_flow() {
 
   launch_app
   sleep 15
+  dismiss_system_dialogs
   screenshot "10-restored-launch.png"
 
   log "Dismissing popups"
@@ -511,15 +572,19 @@ if [[ "$MODE" == "restore" ]]; then
   fi
 fi
 
-# 2. Boot + settle
+# 2. Boot + settle (give the slow CI emulator time, then clear any system dialog)
 wait_for_boot
 settle_device
+sleep 20
+dismiss_system_dialogs
 screenshot "00-home-screen.png"
 
 # 3. Optional spoof
 if [[ "$SPOOF_DEVICE" == "1" ]]; then
   spoof_device_identity || log "spoof step failed, continuing without it"
   settle_device
+  sleep 15
+  dismiss_system_dialogs
   screenshot "00b-after-spoof.png"
 fi
 
@@ -541,6 +606,7 @@ if ! adb install -r -t -g "$APK_FILE"; then
 fi
 adb shell pm list packages | grep -F "$PACKAGE_NAME" || { log "ERROR: package not installed"; exit 1; }
 sleep 2
+dismiss_system_dialogs
 screenshot "01-after-install.png"
 
 # 6. Mode-specific work
@@ -549,10 +615,12 @@ if [[ "$MODE" == "restore" ]]; then
 else
   launch_app
   sleep 10
+  dismiss_system_dialogs
   screenshot "02-after-launch.png"
   sleep 8
+  dismiss_system_dialogs
   screenshot "03-after-launch-18s.png"
-  adb shell dumpsys window | grep -E "mCurrentFocus|mFocusedApp" | head -3
+  log "focus: $(focus_line)"
 
   if [[ "$DO_LOGIN" == "1" ]]; then
     login_flow || log "login flow ended with an error"
