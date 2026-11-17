@@ -1,10 +1,10 @@
-name: Android Install + Screenshots (Spoofed Device)
+name: Android Install + Screenshots
 
 on:
-  workflow_dispatch:          # Manual trigger
+  workflow_dispatch:
     inputs:
       apk_url:
-        description: "Direct URL to the APK"
+        description: "Direct URL to the APK (must be a direct .apk download link)"
         required: true
         type: string
       package_name:
@@ -12,11 +12,11 @@ on:
         required: false
         type: string
         default: ""
-
-  # Optional: also run on push / PR
-  # push:
-  #   branches: [ main ]
-  # pull_request:
+      spoof_device:
+        description: "Try device spoofing (reboots emulator, may not work)"
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   install-and-screenshot:
@@ -27,81 +27,56 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Enable KVM (faster emulator)
+      - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
-      - name: AVD Cache
-        uses: actions/cache@v4
-        id: avd-cache
-        with:
-          path: |
-            ~/.android/avd/*
-            ~/.android/adb*
-          key: avd-api34-${{ runner.os }}
+      - name: Prepare artifacts folder
+        run: mkdir -p artifacts
 
-      - name: Create AVD (API 34 + Google APIs + root capable)
-        if: steps.avd-cache.outputs.cache-hit != 'true'
+      - name: Start emulator and run script
         uses: reactivecircus/android-emulator-runner@v2
+        env:
+          APK_URL: ${{ inputs.apk_url }}
+          PACKAGE_NAME: ${{ inputs.package_name }}
+          SPOOF_DEVICE: ${{ inputs.spoof_device && '1' || '0' }}
         with:
           api-level: 34
           target: google_apis
           arch: x86_64
           profile: pixel_6
-          force-avd-creation: true
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
-          script: echo "AVD created"
+          script: bash .github/scripts/install-and-screenshot.sh
 
-      - name: Start Emulator + Run Script
-        uses: reactivecircus/android-emulator-runner@v2
-        with:
-          api-level: 34
-          target: google_apis
-          arch: x86_64
-          profile: pixel_6
-          force-avd-creation: false
-          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -writable-system
-          disable-animations: true
-          script: |
-            # Give the emulator time to fully boot
-            adb wait-for-device
-            adb shell 'while [[ -z $(getprop sys.boot_completed) ]]; do sleep 1; done'
-
-            # Make the script executable and inject the inputs
-            chmod +x .github/scripts/install-and-screenshot.sh
-
-            # Export the values so the script can use them
-            export APK_URL="${{ inputs.apk_url }}"
-            export PACKAGE_NAME="${{ inputs.package_name }}"
-
-            # Run your original script
-            .github/scripts/install-and-screenshot.sh
-
-      - name: Upload Screenshots
+      - name: Upload screenshots and logs
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: android-screenshots
-          path: artifacts/*
+          path: artifacts/*.png
           if-no-files-found: warn
           retention-days: 14
 
-      - name: Upload APK (optional)
+      - name: Upload logcat
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logcat
+          path: artifacts/logcat.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: downloaded-apk
           path: artifacts/app.apk
+          if-no-files-found: ignore
           retention-days: 7
