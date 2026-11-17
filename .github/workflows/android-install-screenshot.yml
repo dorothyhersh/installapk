@@ -4,16 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       apk_url:
-        description: "Direct URL to the APK (must be a direct .apk download link)"
+        description: "Direct URL to the APK"
         required: true
         type: string
+        default: "https://github.com/bluesky-social/social-app/releases/download/1.136.0/Bluesky-1.136.0.apk"
       package_name:
         description: "Package name (leave empty for auto-detect)"
         required: false
         type: string
         default: ""
       spoof_device:
-        description: "Try device spoofing (reboots emulator, may not work)"
+        description: "Spoof a random device identity (experimental, adds reboots)"
         required: false
         type: boolean
         default: false
@@ -21,14 +22,11 @@ on:
 jobs:
   install-and-screenshot:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Accept Android SDK licenses
-        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
       - name: Enable KVM
         run: |
@@ -36,8 +34,10 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
-      - name: Prepare artifacts folder
-        run: mkdir -p artifacts
+      - name: Debug repo layout
+        run: |
+          ls -la
+          find . -name "*.sh" -not -path "./.git/*"
 
       - name: Start emulator and run script
         uses: reactivecircus/android-emulator-runner@v2
@@ -50,33 +50,17 @@ jobs:
           target: google_apis
           arch: x86_64
           profile: pixel_6
-          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          force-avd-creation: true
+          emulator-boot-timeout: 600
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-metrics ${{ inputs.spoof_device && '-writable-system' || '' }}
           disable-animations: true
           script: bash scripts/install-and-screenshot.sh
 
-      - name: Upload screenshots and logs
+      - name: Upload everything
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: android-screenshots
-          path: artifacts/*.png
+          name: android-output
+          path: artifacts/
           if-no-files-found: warn
           retention-days: 14
-
-      - name: Upload logcat
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: logcat
-          path: artifacts/logcat.txt
-          if-no-files-found: ignore
-          retention-days: 7
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: downloaded-apk
-          path: artifacts/app.apk
-          if-no-files-found: ignore
-          retention-days: 7
