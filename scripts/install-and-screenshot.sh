@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Download APK -> (optional spoof) -> Install -> Launch -> Screenshots
+# Download APK -> (optional spoof) -> Install -> Launch -> Screenshots (+ log preview)
 # Env: APK_URL (required), PACKAGE_NAME (optional), SPOOF_DEVICE (1 = experimental spoof)
 set -uo pipefail
 
@@ -11,16 +11,35 @@ exec > >(tee -a "$ARTIFACTS/run.log") 2>&1
 APK_URL="${APK_URL:-}"
 PACKAGE_NAME="${PACKAGE_NAME:-}"
 SPOOF_DEVICE="${SPOOF_DEVICE:-0}"
-APK_FILE="$ARTIFACTS/app.apk"
+
+# APK is stored OUTSIDE artifacts/ so it is never uploaded
+APK_FILE="${RUNNER_TEMP:-/tmp}/app.apk"
 
 log() { printf '[install] %s\n' "$*"; }
 adb_sh() { adb shell "$@" | tr -d '\r'; }
 
+# Print a colored ASCII preview of a PNG into the step log
+preview() {
+  local f="$1"
+  if command -v chafa >/dev/null 2>&1; then
+    echo "-------- preview: $(basename "$f") --------"
+    chafa --format=symbols --colors=256 --size=50x45 "$f" 2>/dev/null || true
+    echo "-------------------------------------------"
+  fi
+}
+
 screenshot() {
   local f="$ARTIFACTS/$1"
   adb exec-out screencap -p > "$f" 2>/dev/null
-  if [[ -s "$f" ]]; then log "screenshot saved: $1 ($(stat -c%s "$f") bytes)"
-  else log "screenshot FAILED: $1"; rm -f "$f"; fi
+  if [[ -s "$f" ]]; then
+    log "screenshot saved: $1 ($(stat -c%s "$f") bytes)"
+    preview "$f"
+    if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+      echo "- screenshot \`$1\` ($(stat -c%s "$f") bytes)" >> "$GITHUB_STEP_SUMMARY"
+    fi
+  else
+    log "screenshot FAILED: $1"; rm -f "$f"
+  fi
 }
 
 finish() {
@@ -55,7 +74,6 @@ settle_device() {
 }
 
 # ---------- Experimental device spoof ----------
-# Edits build.prop files on the (userdebug) emulator image, then reboots.
 spoof_device_identity() {
   local devices=(
     "samsung|SM-S928B|e3sxxx|e3s|Galaxy S24 Ultra|samsung/e3sxxx/e3s:14/UP1A.231005.007/S928BXXS3AXKF:user/release-keys"
