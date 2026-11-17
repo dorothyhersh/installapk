@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Download APK -> (optional spoof) -> Install -> Launch -> Screenshots (+ log preview)
-# Env: APK_URL (required), PACKAGE_NAME (optional), SPOOF_DEVICE (1 = experimental spoof)
+# Download APK -> Install -> Launch -> (optional) Sign in -> Screenshots
+# Env: APK_URL (required), PACKAGE_NAME (optional), SPOOF_DEVICE (1 = experimental),
+#      DO_LOGIN (1 = log in), BSKY_IDENTIFIER, BSKY_PASSWORD (from GitHub secrets)
 set -uo pipefail
 
 ROOT="${GITHUB_WORKSPACE:-$(pwd)}"
@@ -11,9 +12,13 @@ exec > >(tee -a "$ARTIFACTS/run.log") 2>&1
 APK_URL="${APK_URL:-}"
 PACKAGE_NAME="${PACKAGE_NAME:-}"
 SPOOF_DEVICE="${SPOOF_DEVICE:-0}"
+DO_LOGIN="${DO_LOGIN:-0}"
+BSKY_IDENTIFIER="${BSKY_IDENTIFIER:-}"
+BSKY_PASSWORD="${BSKY_PASSWORD:-}"
 
-# APK is stored OUTSIDE artifacts/ so it is never uploaded
+# APK and UI dumps are stored OUTSIDE artifacts/ so they are never uploaded
 APK_FILE="${RUNNER_TEMP:-/tmp}/app.apk"
+UI_XML="${RUNNER_TEMP:-/tmp}/ui.xml"
 
 log() { printf '[install] %s\n' "$*"; }
 adb_sh() { adb shell "$@" | tr -d '\r'; }
@@ -71,6 +76,126 @@ settle_device() {
   adb shell locksettings set-disabled true >/dev/null 2>&1 || true
   adb shell input keyevent KEYCODE_WAKEUP >/dev/null 2>&1 || true
   adb shell wm dismiss-keyguard >/dev/null 2>&1 || true
+}
+
+# ---------- UI automation helpers (uiautomator) ----------
+ui_dump() {
+  local i
+  for i in 1 2 3; do
+    if adb shell uiautomator dump /sdcard/ui.xml 2>&1 | grep -q "dumped to"; then
+      adb pull /sdcard/ui.xml "$UI_XML" >/dev/null 2>&1 && return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+# ui_find <text|class> <regex> <index>  -> prints "x y" of the match, or nothing
+ui_find() {
+  ui_dump || return 1
+  python3 - "$UI_XML" "$1" "$2" "$3" <<'PY'
+import re, sys, xml.etree.ElementTree as ET
+path, mode, pat, idx = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+rx = re.compile(pat, re.I)
+hits = []
+for n in ET.parse(path).getroot().iter('node'):
+    a = n.attrib
+    if mode == 'class':
+        ok = rx.search(a.get('class', ''))
+    else:
+        ok = rx.search(a.get('text', '')) or rx.search(a.get('content-desc', ''))
+    if ok:
+        m = re.findall(r'\d+', a.get('bounds', ''))
+        if len(m) == 4:
+            x1, y1, x2, y2 = map(int, m)
+            hits.append(((x1 + x2) // 2, (y1 + y2) // 2))
+if len(hits) > idx:
+    print(hits[idx][0], hits[idx][1])
+PY
+}
+
+# tap_text <regex> [fallback "x y"] [tries]
+tap_text() {
+  local pat="$1" fallback="${2:-}" tries="${3:-5}" xy="" i
+  for ((i=0; i<tries; i++)); do
+    xy="$(ui_find text "$pat" 0 || true)"
+    [[ -n "$xy" ]] && break
+    sleep 2
+  done
+  if [[ -z "$xy" && -n "$fallback" ]]; then
+    log "'$pat' not found in UI, tapping fallback coordinates $fallback"
+    xy="$fallback"
+  fi
+  if [[ -z "$xy" ]]; then log "'$pat' not found"; return 1; fi
+  log "tap '$pat' at $xy"
+  adb shell input tap $xy
+}
+
+# tap_field <index>  -> taps the Nth text input
+tap_field() {
+  local xy="" i
+  for i in 1 2 3 4; do
+    xy="$(ui_find class 'EditText' "$1" || true)"
+    [[ -n "$xy" ]] && break
+    sleep 2
+  done
+  if [[ -z "$xy" ]]; then log "text field #$1 not found (typing into focused field)"; return 1; fi
+  log "tap text field #$1 at $xy"
+  adb shell input tap $xy
+}
+
+# type_text <string>  (never logged)
+type_text() {
+  local s="$1" q="'"
+  s="${s//$q/$q\\$q$q}"
+  s="${s// /%s}"
+  adb shell "input text '$s'" >/dev/null 2>&1
+}
+
+login_flow() {
+  if [[ -z "$BSKY_IDENTIFIER" || -z "$BSKY_PASSWORD" ]]; then
+    log "login skipped: BSKY_IDENTIFIER / BSKY_PASSWORD secrets are empty"
+    return 0
+  fi
+
+  log "Login: tapping Sign in"
+  tap_text '^Sign in$' "540 2258" || true
+  sleep 4
+  screenshot "04-signin-screen.png"
+
+  log "Login: entering username/email"
+  tap_field 0 || true
+  sleep 1
+  type_text "$BSKY_IDENTIFIER"
+  sleep 1
+  screenshot "05-username-entered.png"
+
+  log "Login: entering password (hidden in screenshot)"
+  tap_field 1 || true
+  sleep 1
+  type_text "$BSKY_PASSWORD"
+  sleep 1
+  screenshot "06-password-entered.png"
+
+  log "Login: submitting"
+  adb shell input keyevent 66    # ENTER
+  sleep 3
+  tap_text '^Next$' "" 1 || true
+  sleep 12
+  screenshot "07-after-login-12s.png"
+
+  # Look for common problems on screen
+  if ui_dump; then
+    if grep -qiE 'invalid|incorrect|wrong|failed' "$UI_XML"; then
+      log "WARNING: an error message appears to be on screen (wrong credentials?)"
+    fi
+    if grep -qiE 'verification|confirmation code|2fa' "$UI_XML"; then
+      log "WARNING: a verification code is requested (email 2FA). Use an App Password to avoid this."
+    fi
+  fi
+
+  sleep 10
+  screenshot "08-after-login-22s.png"
 }
 
 # ---------- Experimental device spoof ----------
@@ -179,5 +304,12 @@ screenshot "02-after-launch.png"
 sleep 8
 screenshot "03-after-launch-18s.png"
 adb shell dumpsys window | grep -E "mCurrentFocus|mFocusedApp" | head -3
+
+# 7. Sign in
+if [[ "$DO_LOGIN" == "1" ]]; then
+  login_flow || log "login flow ended with an error"
+else
+  log "login disabled (DO_LOGIN=$DO_LOGIN)"
+fi
 
 log "Done!"
