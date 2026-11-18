@@ -18,6 +18,21 @@ on:
         required: false
         type: string
         default: "session.tgz.enc"
+      explore:
+        description: "After restore: search the hashtag and open who liked a recent post"
+        required: false
+        type: boolean
+        default: true
+      hashtag:
+        description: "Hashtag to search"
+        required: false
+        type: string
+        default: "#foodie"
+      max_age_hours:
+        description: "Only open posts not older than this many hours"
+        required: false
+        type: string
+        default: "6"
       resave:
         description: "Upload a fresh backup to Mega after a successful restore"
         required: false
@@ -42,13 +57,16 @@ jobs:
       - name: Install chafa (screenshot preview in logs)
         run: sudo apt-get update -qq && sudo apt-get install -y -qq chafa
 
-      - name: Download from Mega and restore
+      - name: Download from Mega, restore and explore
         uses: reactivecircus/android-emulator-runner@v2
         env:
           MODE: restore
           APK_URL: ${{ inputs.apk_url }}
           PACKAGE_NAME: ${{ inputs.package_name }}
           RESAVE: ${{ inputs.resave && '1' || '0' }}
+          EXPLORE: ${{ inputs.explore && '1' || '0' }}
+          HASHTAG: ${{ inputs.hashtag }}
+          MAX_AGE_HOURS: ${{ inputs.max_age_hours }}
           MEGA_DOWNLOAD: "1"
           MEGA_UPLOAD: "1"
           BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
