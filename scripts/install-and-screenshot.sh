@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # MODE=login   : install -> launch -> sign in -> dismiss popups -> encrypted backup -> upload to Mega
 # MODE=restore : download backup from Mega -> install -> restore -> launch -> dismiss popups -> verify
+#                -> (EXPLORE=1) search hashtag -> Latest -> open a recent post -> open the likes list
 # Env: APK_URL, PACKAGE_NAME, SPOOF_DEVICE, DO_LOGIN, MAKE_BACKUP, RESAVE,
 #      BSKY_IDENTIFIER, BSKY_PASSWORD, BACKUP_PASSPHRASE,
 #      RCLONE_CONF_CONTENT (rclone config text, from the RCLONE_CONF secret),
 #      MEGA_REMOTE (default mega), MEGA_FOLDER (default bluesky-android-backup),
-#      MEGA_FILE (default session.tgz.enc), MEGA_UPLOAD (1), MEGA_DOWNLOAD (1), MEGA_KEEP (10)
+#      MEGA_FILE (default session.tgz.enc), MEGA_UPLOAD (1), MEGA_DOWNLOAD (1), MEGA_KEEP (10),
+#      EXPLORE (restore mode, default 1), HASHTAG (default #foodie), MAX_AGE_HOURS (default 6)
 set -uo pipefail
 
 ROOT="${GITHUB_WORKSPACE:-$(pwd)}"
@@ -25,6 +27,14 @@ RESAVE="${RESAVE:-0}"
 BSKY_IDENTIFIER="${BSKY_IDENTIFIER:-}"
 BSKY_PASSWORD="${BSKY_PASSWORD:-}"
 BACKUP_PASSPHRASE="${BACKUP_PASSPHRASE:-}"
+
+# ----- Explore settings (restore mode) -----
+EXPLORE="${EXPLORE:-1}"
+HASHTAG="${HASHTAG:-#foodie}"
+MAX_AGE_HOURS="${MAX_AGE_HOURS:-6}"
+[[ "$MAX_AGE_HOURS" =~ ^[0-9]+$ ]] || MAX_AGE_HOURS=6
+SCREEN_W=1080
+SCREEN_H=2400
 
 # ----- Mega / rclone settings -----
 RCLONE_CONF_CONTENT="${RCLONE_CONF_CONTENT:-}"
@@ -101,6 +111,12 @@ settle_device() {
   adb shell locksettings set-disabled true >/dev/null 2>&1 || true
   adb shell input keyevent KEYCODE_WAKEUP >/dev/null 2>&1 || true
   adb shell wm dismiss-keyguard >/dev/null 2>&1 || true
+}
+
+read_screen_size() {
+  local s; s="$(adb_sh wm size 2>/dev/null | grep -oE '[0-9]+x[0-9]+' | tail -1)"
+  if [[ -n "$s" ]]; then SCREEN_W="${s%x*}"; SCREEN_H="${s#*x}"; fi
+  log "screen size: ${SCREEN_W}x${SCREEN_H}"
 }
 
 # =====================================================================
@@ -216,36 +232,78 @@ ui_dump() {
   return 1
 }
 
-# ui_query <text|class> <regex> <index>  (uses the last dump) -> prints "x y"
+# ui_query <class|text|textlow|likes> <regex> <index>  (uses the last dump) -> prints "x y"
+#   class   : Nth node whose class matches
+#   text    : Nth node whose text/content-desc matches
+#   textlow : the matching node lowest on the screen (e.g. the bottom tab bar)
+#   likes   : the "<N> likes" counter of an opened post (never the Like button)
 ui_query() {
   python3 - "$UI_XML" "$1" "$2" "$3" <<'PY'
 import re, sys, xml.etree.ElementTree as ET
 path, mode, pat, idx = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
 rx = re.compile(pat, re.I)
+likes_rx = re.compile(r'^\s*\d[\d,.]*\s*[KkMm]?\s+likes?\s*$', re.I)
 hits = []
 for n in ET.parse(path).getroot().iter('node'):
     a = n.attrib
+    t, d = a.get('text', ''), a.get('content-desc', '')
     if mode == 'class':
         ok = rx.search(a.get('class', ''))
+    elif mode == 'likes':
+        ok = likes_rx.match(t) or likes_rx.match(d)
     else:
-        ok = rx.search(a.get('text', '')) or rx.search(a.get('content-desc', ''))
+        ok = rx.search(t) or rx.search(d)
     if ok:
         m = re.findall(r'\d+', a.get('bounds', ''))
         if len(m) == 4:
             x1, y1, x2, y2 = map(int, m)
             hits.append(((x1 + x2) // 2, (y1 + y2) // 2))
-if len(hits) > idx:
+if mode == 'textlow':
+    if hits:
+        h = max(hits, key=lambda p: p[1])
+        print(h[0], h[1])
+elif len(hits) > idx:
     print(hits[idx][0], hits[idx][1])
+PY
+}
+
+# ui_timestamps -> one line per post time on screen: "x y age_in_minutes" (top to bottom)
+ui_timestamps() {
+  python3 - "$UI_XML" <<'PY'
+import re, sys, xml.etree.ElementTree as ET
+rx = re.compile(r'^[\s\u00b7\u2022]*(now|(\d+)\s*(mo|s|m|h|d|w|y))\s*$', re.I)
+mult = {'s': 0, 'm': 1, 'h': 60, 'd': 1440, 'w': 10080, 'mo': 43200, 'y': 525600}
+out = []
+for n in ET.parse(sys.argv[1]).getroot().iter('node'):
+    a = n.attrib
+    for s in (a.get('text', ''), a.get('content-desc', '')):
+        m = rx.match(s)
+        if not m:
+            continue
+        b = re.findall(r'\d+', a.get('bounds', ''))
+        if len(b) != 4:
+            continue
+        x1, y1, x2, y2 = map(int, b)
+        age = 0 if m.group(1).lower() == 'now' else int(m.group(2)) * mult[m.group(3).lower()]
+        out.append((y1, (x1 + x2) // 2, (y1 + y2) // 2, age))
+        break
+out.sort()
+last = -999
+for y1, cx, cy, age in out:
+    if cy - last < 25:
+        continue
+    last = cy
+    print(cx, cy, age)
 PY
 }
 
 ui_find() { ui_dump || return 1; ui_query "$@"; }
 
-# tap_text <regex> [fallback "x y"] [tries]
+# tap_text <regex> [fallback "x y"] [tries] [mode: text|textlow]
 tap_text() {
-  local pat="$1" fallback="${2:-}" tries="${3:-5}" xy="" i
+  local pat="$1" fallback="${2:-}" tries="${3:-5}" mode="${4:-text}" xy="" i
   for ((i=0; i<tries; i++)); do
-    xy="$(ui_find text "$pat" 0 || true)"
+    xy="$(ui_find "$mode" "$pat" 0 || true)"
     [[ -n "$xy" ]] && break
     sleep 2
   done
@@ -271,7 +329,7 @@ tap_field() {
   adb shell input tap $xy
 }
 
-# type_text <string>  (never logged)
+# type_text <string>  (never logged for secrets; spaces and quotes are escaped)
 type_text() {
   local s="$1" q="'"
   s="${s//$q/$q\\$q$q}"
@@ -293,7 +351,6 @@ dismiss_system_dialogs() {
         xy="$(ui_query text '^(Close app|OK)$' 0 || true)"; why="crash -> Close app"
       fi
     else
-      # uiautomator is too busy: detect the ANR window another way
       focus="$(focus_line)"
       if [[ "$focus" == *"Not Responding"* ]]; then
         xy="320 1358"; why="not responding (fallback coordinates) -> Wait"
@@ -499,6 +556,118 @@ login_flow() {
   fi
 }
 
+# ---------- Explore: hashtag search -> recent post -> who liked it ----------
+# Opens the newest posts of the Latest tab, picks one that is at most MAX_AGE_HOURS old
+# and has a likes counter, then taps that counter to show who liked it.
+# Read-only: it never taps the Like button.
+open_recent_post_likes() {
+  local max_min=$(( MAX_AGE_HOURS * 60 ))
+  local scroll line x y age tx ty xy attempt=0 stop=0
+  local yoff=$(( SCREEN_W * 110 / 1080 ))
+
+  for ((scroll=0; scroll<6 && stop==0; scroll++)); do
+    dismiss_system_dialogs
+    if ! ui_dump; then sleep 2; continue; fi
+    local cands=()
+    mapfile -t cands < <(ui_timestamps)
+    log "Explore: ${#cands[@]} post time(s) visible (screen $((scroll+1)))"
+
+    for line in "${cands[@]}"; do
+      read -r x y age <<< "$line"
+      if (( age > max_min )); then
+        log "Explore: the next post is ${age} min old, older than ${MAX_AGE_HOURS}h -> stopping (no more recent posts)"
+        stop=1; break
+      fi
+
+      attempt=$((attempt+1))
+      tx=$(( SCREEN_W - 28 )); ty=$(( y + yoff ))   # right edge of the post body: opens the post, avoids links/buttons
+      log "Explore: opening post #$attempt (${age} min old, y=$y)"
+      adb shell input tap $tx $ty
+      sleep 4
+      dismiss_system_dialogs
+
+      if ! ui_dump; then continue; fi
+      if grep -qE '(text|content-desc)="Latest"' "$UI_XML"; then
+        log "Explore: the post did not open (still on the results list), trying the next one"
+        continue
+      fi
+      screenshot "16-post-opened-${attempt}.png"
+
+      xy="$(ui_query likes '-' 0 || true)"
+      if [[ -n "$xy" ]]; then
+        log "Explore: tapping the likes counter at $xy"
+        adb shell input tap $xy
+        sleep 4
+        dismiss_system_dialogs
+        screenshot "17-who-liked.png"
+        if ui_dump && grep -qi 'liked by' "$UI_XML"; then
+          log "EXPLORE OK: the 'Liked by' list is open (post ${age} min old)"
+        else
+          log "WARNING: tapped the likes counter, but the 'Liked by' title was not detected (see screenshot 17)"
+        fi
+        return 0
+      fi
+
+      log "Explore: this post has no likes counter (0 likes?), going back"
+      adb shell input keyevent 4
+      sleep 3
+      dismiss_system_dialogs
+    done
+
+    (( stop == 1 )) && break
+    log "Explore: scrolling for more posts"
+    adb shell input swipe $((SCREEN_W/2)) $((SCREEN_H*3/4)) $((SCREEN_W/2)) $((SCREEN_H/4)) 450
+    sleep 3
+  done
+
+  log "EXPLORE: no post within the last ${MAX_AGE_HOURS}h with likes was found"
+  return 1
+}
+
+explore_flow() {
+  if [[ "$EXPLORE" != "1" ]]; then log "explore disabled (EXPLORE=$EXPLORE)"; return 0; fi
+  read_screen_size
+  log "Explore: hashtag '$HASHTAG', posts up to ${MAX_AGE_HOURS}h old"
+
+  dismiss_popups 3
+  ensure_app_foreground
+
+  # 1. Search tab (bottom bar)
+  log "Explore: opening the Search tab"
+  if ! tap_text '^Search$' "$((SCREEN_W*3/10)) $((SCREEN_H-130))" 3 textlow; then
+    log "ERROR: Search tab not found"; return 1
+  fi
+  sleep 4
+  dismiss_system_dialogs
+  screenshot "12-search-tab.png"
+
+  # 2. Search field + hashtag
+  if ! tap_field 0; then
+    log "ERROR: search field not found (see screenshot 12)"; return 1
+  fi
+  sleep 1
+  type_text "$HASHTAG"
+  sleep 2
+  screenshot "13-hashtag-typed.png"
+
+  # 3. Submit the search
+  adb shell input keyevent 66
+  sleep 6
+  dismiss_system_dialogs
+  screenshot "14-search-results.png"
+
+  # 4. Latest tab (newest posts first)
+  if ! tap_text '^Latest$' "" 4; then
+    log "WARNING: Latest tab not found, using the current results"
+  fi
+  sleep 5
+  dismiss_system_dialogs
+  screenshot "15-latest-tab.png"
+
+  # 5. Recent post -> likes list
+  open_recent_post_likes
+}
+
 restore_flow() {
   log "Restore: starting the app once so its data folder exists"
   launch_app
@@ -521,6 +690,10 @@ restore_flow() {
 
   if is_logged_in; then
     log "RESTORE OK: the app opened already logged in"
+
+    # extra steps, restore mode only: they never fail the restore
+    explore_flow || log "WARNING: the explore steps did not finish (see screenshots 12-17 and the log above)"
+
     if [[ "$RESAVE" == "1" ]]; then
       backup_and_upload || log "WARNING: refreshed backup was not created"
       launch_app; sleep 6
