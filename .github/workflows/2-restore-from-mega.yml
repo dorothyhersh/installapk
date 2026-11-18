@@ -19,7 +19,7 @@ on:
         type: string
         default: "session.tgz.enc"
       explore:
-        description: "After restore: search the hashtag and open who liked a recent post"
+        description: "After restore: search the hashtag, scan posts, open a recent popular post and its likers"
         required: false
         type: boolean
         default: true
@@ -28,11 +28,34 @@ on:
         required: false
         type: string
         default: "#foodie"
+      results_tab:
+        description: "Results tab to scan"
+        required: false
+        type: choice
+        options:
+          - Top
+          - Latest
+        default: Top
       max_age_hours:
-        description: "Only open posts not older than this many hours"
+        description: "Only posts not older than this many hours (1d counts as 24h; use 23 to exclude 1d)"
+        required: false
+        type: string
+        default: "24"
+      min_likes:
+        description: "Only posts with MORE likes than this"
+        required: false
+        type: string
+        default: "30"
+      fresh_hours:
+        description: "A qualifying post this young (hours) is opened immediately"
         required: false
         type: string
         default: "6"
+      scan_screens:
+        description: "How many screens to scroll while scanning"
+        required: false
+        type: string
+        default: "20"
       resave:
         description: "Upload a fresh backup to Mega after a successful restore"
         required: false
@@ -66,7 +89,11 @@ jobs:
           RESAVE: ${{ inputs.resave && '1' || '0' }}
           EXPLORE: ${{ inputs.explore && '1' || '0' }}
           HASHTAG: ${{ inputs.hashtag }}
+          RESULTS_TAB: ${{ inputs.results_tab }}
           MAX_AGE_HOURS: ${{ inputs.max_age_hours }}
+          MIN_LIKES: ${{ inputs.min_likes }}
+          FRESH_HOURS: ${{ inputs.fresh_hours }}
+          SCAN_SCREENS: ${{ inputs.scan_screens }}
           MEGA_DOWNLOAD: "1"
           MEGA_UPLOAD: "1"
           BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
