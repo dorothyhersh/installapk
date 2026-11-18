@@ -446,7 +446,7 @@ out = []
 for cy, cx, bx1, state in dedup:
     best = None
     for t, d, x1, y1, x2, y2 in nodes:
-        if x2 > bx1 + 10:
+        if (x1 + x2) // 2 >= cx:
             continue
         ncy = (y1 + y2) // 2
         if abs(ncy - cy) > reach:
@@ -466,7 +466,7 @@ for cy, cx, bx1, state in dedup:
     for t, d, x1, y1, x2, y2 in nodes:
         if not t or '@' in t or fol_rx.match(t) or ing_rx.match(t):
             continue
-        if x2 > bx1 + 10:
+        if (x1 + x2) // 2 >= cx:
             continue
         ncy = (y1 + y2) // 2
         if ncy < hy and hy - ncy < 90 * scale:
@@ -888,6 +888,7 @@ follow_likers() {
   log "Follow: following up to $FOLLOW_COUNT people from the Liked by list (as '$FOLLOW_ACCOUNT', time zone $FOLLOW_TZ)"
 
   local done_n=0 r j stale=0 prev="" cur rows=() bx by state handle name st
+  local -A tries=()
   for ((r=1; r<=FOLLOW_MAX_SCREENS && done_n<FOLLOW_COUNT; r++)); do
     dismiss_system_dialogs
     if ! ui_dump; then sleep 2; continue; fi
@@ -913,7 +914,17 @@ follow_likers() {
         log "  @$handle: seen before, skipping"
         continue
       fi
-      printf '%s\n' "$handle" >> "$FOLLOW_SEEN"
+      # Only tap buttons that are fully inside the list: not under the header, and not under the
+      # bottom tab bar (a tap there would hit the Profile/Notifications tab and leave the list).
+      if (( by < SCREEN_H * 14 / 100 || by > SCREEN_H * 88 / 100 )); then
+        log "  @$handle: button at y=$by is too close to the screen edge, will follow after scrolling"
+        continue
+      fi
+      if (( ${tries[$handle]:-0} >= 2 )); then
+        log "  @$handle: could not be followed after 2 tries, skipping"
+        continue
+      fi
+      tries[$handle]=$(( ${tries[$handle]:-0} + 1 ))
 
       local ts_utc ts_date ts_time
       ts_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -934,10 +945,18 @@ follow_likers() {
       done
       if [[ "$st" == "following" ]]; then
         done_n=$((done_n+1))
+        printf '%s\n' "$handle" >> "$FOLLOW_SEEN"
         printf '%s\t%s\t%s\t%s\t%s\n' "$handle" "$name" "$ts_utc" "$ts_date" "$ts_time" >> "$FOLLOWED_TSV"
         log "  FOLLOWED @$handle ($done_n/$FOLLOW_COUNT) at $ts_date $ts_time $FOLLOW_TZ"
       else
         log "  WARNING: could not confirm the follow of @$handle (button state: ${st:-not visible}), not counted"
+        # if the tap left the Liked by list, go back to it
+        if ui_dump && ! grep -qi 'liked by' "$UI_XML"; then
+          log "  the Liked by list is not open any more, pressing Back"
+          adb shell input keyevent 4
+          sleep 3
+          dismiss_system_dialogs
+        fi
       fi
       sleep $((3 + RANDOM % 5))   # small pause between follows
     done
