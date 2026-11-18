@@ -3,13 +3,19 @@
 # MODE=restore : download backup from Mega -> install -> restore -> launch -> dismiss popups -> verify
 #                -> (EXPLORE=1) search hashtag -> scan posts while scrolling (nothing is opened)
 #                -> open a post that is recent AND has enough likes -> open the likers list
+#                -> (FOLLOW_ENABLED=1) follow up to FOLLOW_COUNT of those likers
+#                -> save the followed usernames (with date/time, followed-by account) to .xlsx
+#                -> upload the .xlsx to Mega
 # Env: APK_URL, PACKAGE_NAME, SPOOF_DEVICE, DO_LOGIN, MAKE_BACKUP, RESAVE,
 #      BSKY_IDENTIFIER, BSKY_PASSWORD, BACKUP_PASSPHRASE,
 #      RCLONE_CONF_CONTENT (rclone config text, from the RCLONE_CONF secret),
 #      MEGA_REMOTE (default mega), MEGA_FOLDER (default bluesky-android-backup),
 #      MEGA_FILE (default session.tgz.enc), MEGA_UPLOAD (1), MEGA_DOWNLOAD (1), MEGA_KEEP (10),
 #      EXPLORE (default 1), HASHTAG (#foodie), RESULTS_TAB (Top|Latest, default Top),
-#      MAX_AGE_HOURS (24), MIN_LIKES (30, posts need MORE than this), FRESH_HOURS (6), SCAN_SCREENS (20)
+#      MAX_AGE_HOURS (24), MIN_LIKES (30, posts need MORE than this), FRESH_HOURS (6), SCAN_SCREENS (20),
+#      FOLLOW_ENABLED (1), FOLLOW_COUNT (15), FOLLOW_ACCOUNT (your Bluesky username, written to the xlsx;
+#      falls back to BSKY_IDENTIFIER), FOLLOW_TZ (Asia/Karachi), FOLLOW_MAX_SCREENS (40),
+#      MEGA_FOLLOW_FILE (followed-users.xlsx)
 set -uo pipefail
 
 ROOT="${GITHUB_WORKSPACE:-$(pwd)}"
@@ -45,6 +51,19 @@ SCAN_SCREENS="${SCAN_SCREENS:-20}"
 SCREEN_W=1080
 SCREEN_H=2400
 
+# ----- Follow settings -----
+FOLLOW_ENABLED="${FOLLOW_ENABLED:-1}"
+FOLLOW_COUNT="${FOLLOW_COUNT:-15}"
+FOLLOW_ACCOUNT="${FOLLOW_ACCOUNT:-}"
+[[ -n "$FOLLOW_ACCOUNT" ]] || FOLLOW_ACCOUNT="$BSKY_IDENTIFIER"
+[[ -n "$FOLLOW_ACCOUNT" ]] || FOLLOW_ACCOUNT="unknown"
+FOLLOW_ACCOUNT="${FOLLOW_ACCOUNT#@}"
+FOLLOW_TZ="${FOLLOW_TZ:-Asia/Karachi}"
+FOLLOW_MAX_SCREENS="${FOLLOW_MAX_SCREENS:-40}"
+MEGA_FOLLOW_FILE="${MEGA_FOLLOW_FILE:-followed-users.xlsx}"
+[[ "$FOLLOW_COUNT" =~ ^[0-9]+$ ]]       || FOLLOW_COUNT=15
+[[ "$FOLLOW_MAX_SCREENS" =~ ^[0-9]+$ ]] || FOLLOW_MAX_SCREENS=40
+
 # ----- Mega / rclone settings -----
 RCLONE_CONF_CONTENT="${RCLONE_CONF_CONTENT:-}"
 RCLONE_CFG="${HOME}/.config/rclone/rclone.conf"
@@ -62,6 +81,10 @@ UI_XML="${RUNNER_TEMP:-/tmp}/ui.xml"
 SESSION_TMP="${RUNNER_TEMP:-/tmp}/session.tgz"
 CAND_FILE="${RUNNER_TEMP:-/tmp}/candidates.tsv"
 TRIED_FILE="${RUNNER_TEMP:-/tmp}/tried.txt"
+FOLLOWED_TSV="${RUNNER_TEMP:-/tmp}/followed.tsv"
+FOLLOW_SEEN="${RUNNER_TEMP:-/tmp}/follow_seen.txt"
+FOLLOW_LOG_IN="${RUNNER_TEMP:-/tmp}/followed-users-existing.xlsx"
+SOURCE_POST=""
 
 # Buttons that close in-app popups / dialogs
 DISMISS_REGEX='^(Cancel|Not now|Maybe later|No thanks|Skip|Later|Dismiss|Got it)\b'
@@ -379,6 +402,84 @@ if out:
 PY
 }
 
+# ui_follow_rows -> one line per person row visible in the last dump (top to bottom), tab separated:
+#   <button_x> <button_y> <state: follow|following> <handle (no @)> <display name (may be empty)>
+# Used on the "Liked by" list. A row is a Follow / Follow back / Following button plus the
+# "@handle" text next to it. The display name is last because it may be empty.
+ui_follow_rows() {
+  python3 - "$UI_XML" "$SCREEN_W" <<'PY'
+import re, sys, xml.etree.ElementTree as ET
+path, sw = sys.argv[1], int(sys.argv[2])
+scale = sw / 1080.0
+h_rx = re.compile(r'@([A-Za-z0-9][A-Za-z0-9._-]*\.[A-Za-z0-9.-]*[A-Za-z0-9])')
+fol_rx = re.compile(r'^\s*follow( back)?\s*$', re.I)
+ing_rx = re.compile(r'^\s*following\s*$', re.I)
+
+nodes = []
+for n in ET.parse(path).getroot().iter('node'):
+    a = n.attrib
+    b = re.findall(r'\d+', a.get('bounds', ''))
+    if len(b) != 4:
+        continue
+    x1, y1, x2, y2 = map(int, b)
+    nodes.append((a.get('text', '').strip(), a.get('content-desc', '').strip(), x1, y1, x2, y2))
+
+btns = []
+for t, d, x1, y1, x2, y2 in nodes:
+    state = None
+    for s in (t, d):
+        if fol_rx.match(s):
+            state = 'follow'; break
+        if ing_rx.match(s):
+            state = 'following'; break
+    if state:
+        btns.append(((y1 + y2) // 2, (x1 + x2) // 2, x1, state))
+btns.sort()
+dedup = []
+for b in btns:
+    if dedup and abs(b[0] - dedup[-1][0]) < 30:
+        continue
+    dedup.append(b)
+
+reach = 130 * scale
+out = []
+for cy, cx, bx1, state in dedup:
+    best = None
+    for t, d, x1, y1, x2, y2 in nodes:
+        if x2 > bx1 + 10:
+            continue
+        ncy = (y1 + y2) // 2
+        if abs(ncy - cy) > reach:
+            continue
+        for s in (t, d):
+            m = h_rx.search(s)
+            if m:
+                dist = abs(ncy - cy)
+                if best is None or dist < best[0]:
+                    best = (dist, m.group(1).lower(), ncy)
+                break
+    if not best:
+        continue
+    handle, hy = best[1], best[2]
+    name = ''
+    nbest = None
+    for t, d, x1, y1, x2, y2 in nodes:
+        if not t or '@' in t or fol_rx.match(t) or ing_rx.match(t):
+            continue
+        if x2 > bx1 + 10:
+            continue
+        ncy = (y1 + y2) // 2
+        if ncy < hy and hy - ncy < 90 * scale:
+            if nbest is None or hy - ncy < nbest[0]:
+                nbest = (hy - ncy, t)
+    if nbest:
+        name = nbest[1].replace('\t', ' ').replace('\n', ' ')
+    out.append('%d\t%d\t%s\t%s\t%s' % (cx, cy, state, handle, name))
+if out:
+    print('\n'.join(out))
+PY
+}
+
 ui_find() { ui_dump || return 1; ui_query "$@"; }
 
 # tap_text <regex> [fallback "x y"] [tries] [mode: text|textlow]
@@ -639,9 +740,226 @@ login_flow() {
 }
 
 # =====================================================================
+#  Follow: follow people from the "Liked by" list and keep an .xlsx log
+# =====================================================================
+
+ensure_openpyxl() {
+  python3 -c 'import openpyxl' >/dev/null 2>&1 && return 0
+  log "installing openpyxl..."
+  pip install -q openpyxl >/dev/null 2>&1 \
+    || pip install -q --break-system-packages openpyxl >/dev/null 2>&1 \
+    || sudo pip install -q --break-system-packages openpyxl >/dev/null 2>&1 \
+    || true
+  python3 -c 'import openpyxl' >/dev/null 2>&1
+}
+
+# Download the cumulative log (if any) so people followed in earlier runs are skipped
+# and this run's rows are appended to it. Fills FOLLOW_SEEN with the old usernames.
+load_follow_history() {
+  : > "$FOLLOW_SEEN"
+  rm -f "$FOLLOW_LOG_IN"
+  [[ "$MEGA_DOWNLOAD" == "1" || "$MEGA_UPLOAD" == "1" ]] || return 0
+  setup_rclone || { log "Follow: no Mega access, starting a new follow log"; return 0; }
+  if [[ -n "$(rclone lsf "${MEGA_DIR}/${MEGA_FOLLOW_FILE}" 2>/dev/null)" ]]; then
+    if rclone copyto "${MEGA_DIR}/${MEGA_FOLLOW_FILE}" "$FOLLOW_LOG_IN" --retries 5 -q && [[ -s "$FOLLOW_LOG_IN" ]]; then
+      ensure_openpyxl || true
+      python3 - "$FOLLOW_LOG_IN" > "$FOLLOW_SEEN" <<'PY' || true
+import sys
+from openpyxl import load_workbook
+try:
+    ws = load_workbook(sys.argv[1]).active
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if len(row) > 1 and row[1]:
+            print(str(row[1]).strip().lstrip('@').lower())
+except Exception:
+    pass
+PY
+      log "Follow: loaded the existing follow log from Mega ($(wc -l < "$FOLLOW_SEEN") user(s) already followed)"
+    else
+      rm -f "$FOLLOW_LOG_IN"
+      log "WARNING: could not download the existing follow log, starting a new one"
+    fi
+  else
+    log "Follow: no follow log on Mega yet, a new one will be created"
+  fi
+}
+
+# Build the .xlsx files from FOLLOWED_TSV: the cumulative master (existing rows + this run) and
+# a file with only this run. Columns: #, username, display name, profile URL, followed by,
+# date, time, timezone, UTC timestamp, source hashtag, source post.
+build_follow_xlsx() {
+  local master_out="$1" run_out="$2"
+  python3 - "$FOLLOW_LOG_IN" "$FOLLOWED_TSV" "$master_out" "$run_out" "$FOLLOW_ACCOUNT" "$HASHTAG" "$SOURCE_POST" "$FOLLOW_TZ" <<'PY'
+import os, sys
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
+
+old_path, tsv, master_out, run_out, by, tag, src, tz = sys.argv[1:9]
+headers = ["#", "Followed Username", "Display Name", "Profile URL", "Followed By (Bluesky username)",
+           "Date Followed", "Time Followed", "Timezone", "Followed At (UTC)", "Source Hashtag", "Source Post"]
+
+new_rows = []
+with open(tsv, encoding='utf-8') as f:
+    for line in f:
+        p = line.rstrip('\n').split('\t')
+        if len(p) < 5 or not p[0].strip():
+            continue
+        handle, name, utc, d, t = p[0].strip(), p[1], p[2], p[3], p[4]
+        new_rows.append([handle, name, "https://bsky.app/profile/" + handle, by, d, t, tz, utc, tag, src])
+
+old_rows = []
+if old_path and os.path.exists(old_path):
+    try:
+        ws = load_workbook(old_path).active
+        for r in ws.iter_rows(min_row=2, values_only=True):
+            if r and len(r) > 1 and r[1]:
+                old_rows.append(["" if v is None else v for v in r[1:11]])
+    except Exception as e:
+        print("could not read the old log:", e)
+
+def write(path, rows):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Followed"
+    ws.append(headers)
+    for i, r in enumerate(rows, 1):
+        ws.append([i] + list(r))
+    fill = PatternFill("solid", fgColor="1F4E78")
+    for c in ws[1]:
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = fill
+        c.alignment = Alignment(vertical="center")
+    widths = [5, 30, 28, 48, 30, 14, 12, 16, 22, 16, 40]
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    for row in ws.iter_rows(min_row=2):
+        row[3].hyperlink = row[3].value
+        row[3].font = Font(color="0563C1", underline="single")
+    wb.save(path)
+
+write(master_out, old_rows + new_rows)
+write(run_out, new_rows)
+print("rows this run: %d, rows in master: %d" % (len(new_rows), len(old_rows) + len(new_rows)))
+PY
+}
+
+upload_follow_xlsx() {
+  local master="$1" run="$2" stamp="$3"
+  if [[ "$MEGA_UPLOAD" != "1" ]]; then log "Follow: Mega upload disabled (MEGA_UPLOAD=$MEGA_UPLOAD)"; return 0; fi
+  setup_rclone || return 1
+  rclone mkdir "$MEGA_DIR" --retries 5 || { log "Follow: cannot open the Mega folder"; return 1; }
+  rclone copyto "$master" "${MEGA_DIR}/${MEGA_FOLLOW_FILE}" --retries 5 -q \
+    || { log "Follow: upload failed: ${MEGA_FOLLOW_FILE}"; return 1; }
+  rclone copyto "$run" "${MEGA_DIR}/followed-run-${stamp}.xlsx" --retries 5 -q \
+    || log "WARNING: per-run follow file was not uploaded"
+  if [[ -z "$(rclone lsf "${MEGA_DIR}/${MEGA_FOLLOW_FILE}" 2>/dev/null)" ]]; then
+    log "Follow: Mega upload could not be verified"; return 1
+  fi
+  log "FOLLOW LOG UPLOADED: ${MEGA_FOLDER}/${MEGA_FOLLOW_FILE} and followed-run-${stamp}.xlsx"
+  if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+    echo "- Follow log uploaded to Mega: \`${MEGA_FOLDER}/${MEGA_FOLLOW_FILE}\` (+ \`followed-run-${stamp}.xlsx\`)" >> "$GITHUB_STEP_SUMMARY"
+  fi
+}
+
+export_followed() {
+  if [[ ! -s "$FOLLOWED_TSV" ]]; then
+    log "Follow: nobody was followed, no .xlsx created"
+    return 0
+  fi
+  if ! ensure_openpyxl; then log "ERROR: openpyxl is not available, cannot create the .xlsx"; return 1; fi
+  local stamp; stamp="$(date -u +%Y%m%d-%H%M%S)"
+  local master="$ARTIFACTS/${MEGA_FOLLOW_FILE}"
+  local run="$ARTIFACTS/followed-run-${stamp}.xlsx"
+  build_follow_xlsx "$master" "$run" || { log "ERROR: building the .xlsx failed"; return 1; }
+  log "Follow: saved $master and $run"
+  upload_follow_xlsx "$master" "$run" "$stamp" || log "WARNING: the follow .xlsx was saved in the artifacts but NOT uploaded to Mega"
+}
+
+# Scroll the "Liked by" list and follow up to FOLLOW_COUNT people. Only counts a follow
+# when the button turns into "Following" afterwards.
+follow_likers() {
+  read_screen_size
+  ensure_openpyxl || log "WARNING: openpyxl missing (the .xlsx step will retry)"
+  load_follow_history
+  : > "$FOLLOWED_TSV"
+  log "Follow: following up to $FOLLOW_COUNT people from the Liked by list (as '$FOLLOW_ACCOUNT', time zone $FOLLOW_TZ)"
+
+  local done_n=0 r j stale=0 prev="" cur rows=() bx by state handle name st
+  for ((r=1; r<=FOLLOW_MAX_SCREENS && done_n<FOLLOW_COUNT; r++)); do
+    dismiss_system_dialogs
+    if ! ui_dump; then sleep 2; continue; fi
+    if ! grep -qi 'liked by' "$UI_XML"; then
+      log "Follow: the Liked by list is no longer open, stopping"
+      break
+    fi
+    cur="$(md5sum "$UI_XML" | cut -d' ' -f1)"
+    if [[ "$cur" == "$prev" ]]; then stale=$((stale+1)); else stale=0; fi
+    prev="$cur"
+    if (( stale >= 2 )); then log "Follow: reached the end of the list"; break; fi
+
+    mapfile -t rows < <(ui_follow_rows)
+    log "Follow: screen $r, ${#rows[@]} person row(s) with a follow button"
+    for ((j=0; j<${#rows[@]} && done_n<FOLLOW_COUNT; j++)); do
+      IFS=$'\t' read -r bx by state handle name <<< "${rows[$j]}"
+      [[ -n "$handle" ]] || continue
+      if [[ "$state" != "follow" ]]; then
+        log "  @$handle: already followed, skipping"
+        continue
+      fi
+      if grep -qixF -- "$handle" "$FOLLOW_SEEN" 2>/dev/null; then
+        log "  @$handle: seen before, skipping"
+        continue
+      fi
+      printf '%s\n' "$handle" >> "$FOLLOW_SEEN"
+
+      local ts_utc ts_date ts_time
+      ts_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      ts_date="$(TZ="$FOLLOW_TZ" date +%Y-%m-%d)"
+      ts_time="$(TZ="$FOLLOW_TZ" date +%H:%M:%S)"
+      log "  @$handle: tapping Follow at $bx $by"
+      adb shell input tap "$bx" "$by"
+      sleep 2
+      dismiss_system_dialogs
+
+      st=""
+      for _ in 1 2; do
+        if ui_dump; then
+          st="$(ui_follow_rows | awk -F'\t' -v h="$handle" '$4==h{print $3; exit}')"
+        fi
+        [[ "$st" == "following" ]] && break
+        sleep 2
+      done
+      if [[ "$st" == "following" ]]; then
+        done_n=$((done_n+1))
+        printf '%s\t%s\t%s\t%s\t%s\n' "$handle" "$name" "$ts_utc" "$ts_date" "$ts_time" >> "$FOLLOWED_TSV"
+        log "  FOLLOWED @$handle ($done_n/$FOLLOW_COUNT) at $ts_date $ts_time $FOLLOW_TZ"
+      else
+        log "  WARNING: could not confirm the follow of @$handle (button state: ${st:-not visible}), not counted"
+      fi
+      sleep $((3 + RANDOM % 5))   # small pause between follows
+    done
+
+    if (( done_n < FOLLOW_COUNT )); then
+      adb shell input swipe $((SCREEN_W/2)) $((SCREEN_H*72/100)) $((SCREEN_W/2)) $((SCREEN_H*30/100)) 600
+      sleep 2
+    fi
+  done
+
+  screenshot "19-after-following.png"
+  log "Follow: finished, followed $done_n of $FOLLOW_COUNT requested"
+  if (( done_n < FOLLOW_COUNT )); then
+    log "NOTE: fewer than $FOLLOW_COUNT people could be followed from this post (the list ended or everyone was already followed). Lower MIN_LIKES or use a post with more likers."
+  fi
+  export_followed
+}
+
+# =====================================================================
 #  Explore: scan the hashtag results (nothing is opened while scanning), then open ONE
 #  post that is recent AND has more than MIN_LIKES likes, and open its likers list.
-#  Read-only: the Like button is never tapped.
+#  The Like button is never tapped.
 # =====================================================================
 SCAN_LAST=0
 SCAN_SHOTS=0
@@ -722,7 +1040,7 @@ open_post() {
   post_opened
 }
 
-# In the opened post: tap the "N likes" line to show who liked it
+# In the opened post: tap the "N likes" line to show who liked it, then follow some of them
 show_likers() {
   local xy="" i
   screenshot "16-post-opened.png"
@@ -747,8 +1065,12 @@ show_likers() {
   screenshot "17-who-liked.png"
   if ui_dump && grep -qi 'liked by' "$UI_XML"; then
     log "EXPLORE OK: the 'Liked by' list is open"
+    if [[ "$FOLLOW_ENABLED" == "1" && "$FOLLOW_COUNT" -gt 0 ]]; then
+      follow_likers || log "WARNING: the follow step ended with an error (see the log above)"
+      return 0
+    fi
   else
-    log "WARNING: tapped the likes counter, but the 'Liked by' title was not detected (see screenshot 17)"
+    log "WARNING: tapped the likes counter, but the 'Liked by' title was not detected (see screenshot 17), not following anyone"
   fi
   adb shell input swipe $((SCREEN_W/2)) $((SCREEN_H*70/100)) $((SCREEN_W/2)) $((SCREEN_H*40/100)) 500
   sleep 2
@@ -759,6 +1081,7 @@ show_likers() {
 try_candidate() {
   local x="$1" y="$2" sig="$3"
   printf '%s\n' "$sig" >> "$TRIED_FILE"
+  SOURCE_POST="${sig//|/ - }"
   open_post "$x" "$y" && show_likers
 }
 
@@ -882,7 +1205,7 @@ restore_flow() {
     log "RESTORE OK: the app opened already logged in"
 
     # extra steps, restore mode only: they never fail the restore
-    explore_flow || log "WARNING: the explore steps did not finish (see screenshots 12-18 and the log above)"
+    explore_flow || log "WARNING: the explore steps did not finish (see screenshots 12-19 and the log above)"
 
     if [[ "$RESAVE" == "1" ]]; then
       backup_and_upload || log "WARNING: refreshed backup was not created"
