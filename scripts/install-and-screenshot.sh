@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # MODE=login   : install -> launch -> sign in -> dismiss popups -> encrypted backup -> upload to Mega
 # MODE=restore : download backup from Mega -> install -> restore -> launch -> dismiss popups -> verify
-#                -> (EXPLORE=1) search hashtag -> Latest -> open a recent post -> open the likes list
+#                -> (EXPLORE=1) search hashtag -> scan posts while scrolling (nothing is opened)
+#                -> open a post that is recent AND has enough likes -> open the likers list
 # Env: APK_URL, PACKAGE_NAME, SPOOF_DEVICE, DO_LOGIN, MAKE_BACKUP, RESAVE,
 #      BSKY_IDENTIFIER, BSKY_PASSWORD, BACKUP_PASSPHRASE,
 #      RCLONE_CONF_CONTENT (rclone config text, from the RCLONE_CONF secret),
 #      MEGA_REMOTE (default mega), MEGA_FOLDER (default bluesky-android-backup),
 #      MEGA_FILE (default session.tgz.enc), MEGA_UPLOAD (1), MEGA_DOWNLOAD (1), MEGA_KEEP (10),
-#      EXPLORE (restore mode, default 1), HASHTAG (default #foodie), MAX_AGE_HOURS (default 6)
+#      EXPLORE (default 1), HASHTAG (#foodie), RESULTS_TAB (Top|Latest, default Top),
+#      MAX_AGE_HOURS (24), MIN_LIKES (30, posts need MORE than this), FRESH_HOURS (6), SCAN_SCREENS (20)
 set -uo pipefail
 
 ROOT="${GITHUB_WORKSPACE:-$(pwd)}"
@@ -31,8 +33,15 @@ BACKUP_PASSPHRASE="${BACKUP_PASSPHRASE:-}"
 # ----- Explore settings (restore mode) -----
 EXPLORE="${EXPLORE:-1}"
 HASHTAG="${HASHTAG:-#foodie}"
-MAX_AGE_HOURS="${MAX_AGE_HOURS:-6}"
-[[ "$MAX_AGE_HOURS" =~ ^[0-9]+$ ]] || MAX_AGE_HOURS=6
+RESULTS_TAB="${RESULTS_TAB:-Top}"
+MAX_AGE_HOURS="${MAX_AGE_HOURS:-24}"
+MIN_LIKES="${MIN_LIKES:-30}"
+FRESH_HOURS="${FRESH_HOURS:-6}"
+SCAN_SCREENS="${SCAN_SCREENS:-20}"
+[[ "$MAX_AGE_HOURS" =~ ^[0-9]+$ ]] || MAX_AGE_HOURS=24
+[[ "$MIN_LIKES" =~ ^[0-9]+$ ]]     || MIN_LIKES=30
+[[ "$FRESH_HOURS" =~ ^[0-9]+$ ]]   || FRESH_HOURS=6
+[[ "$SCAN_SCREENS" =~ ^[0-9]+$ ]]  || SCAN_SCREENS=20
 SCREEN_W=1080
 SCREEN_H=2400
 
@@ -51,6 +60,8 @@ MEGA_DIR="${MEGA_REMOTE}:${MEGA_FOLDER}"
 APK_FILE="${RUNNER_TEMP:-/tmp}/app.apk"
 UI_XML="${RUNNER_TEMP:-/tmp}/ui.xml"
 SESSION_TMP="${RUNNER_TEMP:-/tmp}/session.tgz"
+CAND_FILE="${RUNNER_TEMP:-/tmp}/candidates.tsv"
+TRIED_FILE="${RUNNER_TEMP:-/tmp}/tried.txt"
 
 # Buttons that close in-app popups / dialogs
 DISMISS_REGEX='^(Cancel|Not now|Maybe later|No thanks|Skip|Later|Dismiss|Got it)\b'
@@ -267,33 +278,104 @@ elif len(hits) > idx:
 PY
 }
 
-# ui_timestamps -> one line per post time on screen: "x y age_in_minutes" (top to bottom)
-ui_timestamps() {
-  python3 - "$UI_XML" <<'PY'
+# ui_posts -> one line per post visible in the last dump (top to bottom), tab separated:
+#   <x> <y> <age_in_minutes> <likes or -1> <signature>
+# x,y = the post's time label (tapping it opens the post). likes = -1 when the action bar is not visible.
+ui_posts() {
+  python3 - "$UI_XML" "$SCREEN_W" <<'PY'
 import re, sys, xml.etree.ElementTree as ET
-rx = re.compile(r'^[\s\u00b7\u2022]*(now|(\d+)\s*(mo|s|m|h|d|w|y))\s*$', re.I)
+path, sw = sys.argv[1], int(sys.argv[2])
+scale = sw / 1080.0
+ts_rx = re.compile(r'^[\s\u00b7\u2022]*(now|(\d+)\s*(mo|s|m|h|d|w|y))\s*$', re.I)
 mult = {'s': 0, 'm': 1, 'h': 60, 'd': 1440, 'w': 10080, 'mo': 43200, 'y': 525600}
-out = []
-for n in ET.parse(sys.argv[1]).getroot().iter('node'):
+cnt_rx = re.compile(r'\((\d[\d,.]*)\s*([KkMm]?)\s+likes?\)', re.I)
+numtxt_rx = re.compile(r'^(\d[\d,.]*)\s*([KkMm]?)$')
+
+def tonum(n, suf):
+    try:
+        v = float(n.replace(',', ''))
+    except ValueError:
+        return 0
+    s = suf.lower()
+    if s == 'k':
+        v *= 1000
+    elif s == 'm':
+        v *= 1000000
+    return int(v)
+
+def norm(s):
+    return ' '.join(re.sub(r'[^a-z0-9]+', ' ', s.lower()).split())
+
+nodes = []
+for n in ET.parse(path).getroot().iter('node'):
     a = n.attrib
-    for s in (a.get('text', ''), a.get('content-desc', '')):
-        m = rx.match(s)
-        if not m:
-            continue
-        b = re.findall(r'\d+', a.get('bounds', ''))
-        if len(b) != 4:
-            continue
-        x1, y1, x2, y2 = map(int, b)
-        age = 0 if m.group(1).lower() == 'now' else int(m.group(2)) * mult[m.group(3).lower()]
-        out.append((y1, (x1 + x2) // 2, (y1 + y2) // 2, age))
-        break
-out.sort()
-last = -999
-for y1, cx, cy, age in out:
-    if cy - last < 25:
+    b = re.findall(r'\d+', a.get('bounds', ''))
+    if len(b) != 4:
         continue
-    last = cy
-    print(cx, cy, age)
+    x1, y1, x2, y2 = map(int, b)
+    nodes.append((a.get('text', ''), a.get('content-desc', ''), x1, y1, x2, y2))
+
+# post time labels
+tss = []
+for t, d, x1, y1, x2, y2 in nodes:
+    for s in (t, d):
+        m = ts_rx.match(s)
+        if m:
+            age = 0 if m.group(1).lower() == 'now' else int(m.group(2)) * mult[m.group(3).lower()]
+            tss.append(((y1 + y2) // 2, (x1 + x2) // 2, x1, age))
+            break
+tss.sort()
+posts = []
+for ts in tss:
+    if posts and ts[0] - posts[-1][0] < 25:
+        continue
+    posts.append(ts)
+
+# like buttons (heart) with their counts
+hearts = []
+for t, d, x1, y1, x2, y2 in nodes:
+    if re.match(r'^(un)?like\b', d, re.I):
+        cy = (y1 + y2) // 2
+        m = cnt_rx.search(d)
+        if m:
+            likes = tonum(m.group(1), m.group(2))
+        else:
+            likes = 0
+            best = None
+            for t2, d2, a1, b1, a2, b2 in nodes:
+                mm = numtxt_rx.match(t2.strip())
+                if mm and abs((b1 + b2) // 2 - cy) < 30 and a1 >= x1 - 5 and a1 <= x2 + 30 * scale:
+                    if best is None or a1 < best[0]:
+                        best = (a1, tonum(mm.group(1), mm.group(2)))
+            if best:
+                likes = best[1]
+        hearts.append((cy, likes))
+hearts.sort()
+
+out = []
+for i, (cy, cx, x1ts, age) in enumerate(posts):
+    nxt = posts[i + 1][0] if i + 1 < len(posts) else 10 ** 9
+    likes, hy = -1, None
+    for hcy, hl in hearts:
+        if cy + 40 < hcy < nxt:
+            likes, hy = hl, hcy
+            break
+    name = ''
+    cand = [(x1, t) for t, d, x1, y1, x2, y2 in nodes
+            if t.strip() and len(t.strip()) > 1 and abs((y1 + y2) // 2 - cy) < 30
+            and x2 <= x1ts + 5 and not ts_rx.match(t) and not t.strip().startswith('@')]
+    if cand:
+        name = min(cand)[1]
+    body = ''
+    lim = hy if hy else cy + 900
+    bc = [(y1, t) for t, d, x1, y1, x2, y2 in nodes
+          if len(t.strip()) >= 8 and cy + 25 < (y1 + y2) // 2 < lim]
+    if bc:
+        body = min(bc)[1]
+    sig = norm(name)[:24] + '|' + norm(body)[:30]
+    out.append('%d\t%d\t%d\t%d\t%s' % (cx, cy, age, likes, sig))
+if out:
+    print('\n'.join(out))
 PY
 }
 
@@ -556,78 +638,169 @@ login_flow() {
   fi
 }
 
-# ---------- Explore: hashtag search -> recent post -> who liked it ----------
-# Opens the newest posts of the Latest tab, picks one that is at most MAX_AGE_HOURS old
-# and has a likes counter, then taps that counter to show who liked it.
-# Read-only: it never taps the Like button.
-open_recent_post_likes() {
-  local max_min=$(( MAX_AGE_HOURS * 60 ))
-  local scroll line x y age tx ty xy attempt=0 stop=0
-  local yoff=$(( SCREEN_W * 110 / 1080 ))
+# =====================================================================
+#  Explore: scan the hashtag results (nothing is opened while scanning), then open ONE
+#  post that is recent AND has more than MIN_LIKES likes, and open its likers list.
+#  Read-only: the Like button is never tapped.
+# =====================================================================
+SCAN_LAST=0
+SCAN_SHOTS=0
+FRESH_X=""; FRESH_Y=""; FRESH_SIG=""
 
-  for ((scroll=0; scroll<6 && stop==0; scroll++)); do
-    dismiss_system_dialogs
-    if ! ui_dump; then sleep 2; continue; fi
-    local cands=()
-    mapfile -t cands < <(ui_timestamps)
-    log "Explore: ${#cands[@]} post time(s) visible (screen $((scroll+1)))"
+fmt_age() {
+  local m="$1"
+  if (( m >= 1440 )); then echo "$((m/1440))d"
+  elif (( m >= 60 )); then echo "$((m/60))h"
+  else echo "${m}m"; fi
+}
 
-    for line in "${cands[@]}"; do
-      read -r x y age <<< "$line"
-      if (( age > max_min )); then
-        log "Explore: the next post is ${age} min old, older than ${MAX_AGE_HOURS}h -> stopping (no more recent posts)"
-        stop=1; break
+scroll_feed() {
+  adb shell input swipe $((SCREEN_W/2)) $((SCREEN_H*72/100)) $((SCREEN_W/2)) $((SCREEN_H*22/100)) 600
+  sleep 2
+}
+scroll_back() {
+  adb shell input swipe $((SCREEN_W/2)) $((SCREEN_H*22/100)) $((SCREEN_W/2)) $((SCREEN_H*72/100)) 600
+  sleep 2
+}
+
+# Logs every post on the current screen and records the ones that qualify.
+# Sets FRESH_X/FRESH_Y/FRESH_SIG when a qualifying post is at most FRESH_HOURS old.
+consider_screen() {
+  local idx="$1" max_min=$(( MAX_AGE_HOURS * 60 )) fresh_min=$(( FRESH_HOURS * 60 ))
+  local lines=() j x y age likes sig tag found=0 fresh_age=999999999
+  FRESH_X=""; FRESH_Y=""; FRESH_SIG=""
+  mapfile -t lines < <(ui_posts)
+  log "Scan screen $idx: ${#lines[@]} post(s) visible"
+  for ((j=0; j<${#lines[@]}; j++)); do
+    IFS=$'\t' read -r x y age likes sig <<< "${lines[$j]}"
+    [[ -n "$sig" ]] || continue
+    if (( likes < 0 )); then
+      tag="likes not visible yet"
+    elif (( age > max_min )); then
+      tag="too old"
+    elif (( likes <= MIN_LIKES )); then
+      tag="too few likes"
+    elif grep -qxF -- "$sig" "$TRIED_FILE" 2>/dev/null; then
+      tag="already tried"
+    else
+      tag="CANDIDATE"
+      if ! awk -F'\t' -v s="$sig" '$4==s{f=1} END{exit !f}' "$CAND_FILE" 2>/dev/null; then
+        printf '%s\t%s\t%s\t%s\n' "$idx" "$age" "$likes" "$sig" >> "$CAND_FILE"
+        found=1
       fi
-
-      attempt=$((attempt+1))
-      tx=$(( SCREEN_W - 28 )); ty=$(( y + yoff ))   # right edge of the post body: opens the post, avoids links/buttons
-      log "Explore: opening post #$attempt (${age} min old, y=$y)"
-      adb shell input tap $tx $ty
-      sleep 4
-      dismiss_system_dialogs
-
-      if ! ui_dump; then continue; fi
-      if grep -qE '(text|content-desc)="Latest"' "$UI_XML"; then
-        log "Explore: the post did not open (still on the results list), trying the next one"
-        continue
+      if (( age <= fresh_min && age < fresh_age )); then
+        fresh_age="$age"; FRESH_X="$x"; FRESH_Y="$y"; FRESH_SIG="$sig"
       fi
-      screenshot "16-post-opened-${attempt}.png"
-
-      xy="$(ui_query likes '-' 0 || true)"
-      if [[ -n "$xy" ]]; then
-        log "Explore: tapping the likes counter at $xy"
-        adb shell input tap $xy
-        sleep 4
-        dismiss_system_dialogs
-        screenshot "17-who-liked.png"
-        if ui_dump && grep -qi 'liked by' "$UI_XML"; then
-          log "EXPLORE OK: the 'Liked by' list is open (post ${age} min old)"
-        else
-          log "WARNING: tapped the likes counter, but the 'Liked by' title was not detected (see screenshot 17)"
-        fi
-        return 0
-      fi
-
-      log "Explore: this post has no likes counter (0 likes?), going back"
-      adb shell input keyevent 4
-      sleep 3
-      dismiss_system_dialogs
-    done
-
-    (( stop == 1 )) && break
-    log "Explore: scrolling for more posts"
-    adb shell input swipe $((SCREEN_W/2)) $((SCREEN_H*3/4)) $((SCREEN_W/2)) $((SCREEN_H/4)) 450
-    sleep 3
+    fi
+    log "  post $(fmt_age "$age") old, likes=$likes [${sig:0:24}] -> $tag"
   done
+  if (( found == 1 && SCAN_SHOTS < 5 )); then
+    SCAN_SHOTS=$((SCAN_SHOTS+1))
+    screenshot "15-scan-$(printf '%02d' "$idx").png"
+  fi
+}
 
-  log "EXPLORE: no post within the last ${MAX_AGE_HOURS}h with likes was found"
+# the opened post (thread view) has no search tabs
+post_opened() {
+  ui_dump || return 1
+  ! grep -qiE 'Starter Packs' "$UI_XML"
+}
+
+# open_post <x> <y>: tap the post's time label (it links to the post); fall back to the blank right edge
+open_post() {
+  local x="$1" y="$2"
+  log "Explore: opening the post (tap $x $y)"
+  adb shell input tap "$x" "$y"
+  sleep 4
+  dismiss_system_dialogs
+  if post_opened; then return 0; fi
+  local fx=$(( SCREEN_W - 28 )) fy=$(( y + SCREEN_W * 110 / 1080 ))
+  log "Explore: the post did not open, second try at the right edge ($fx $fy)"
+  adb shell input tap "$fx" "$fy"
+  sleep 4
+  dismiss_system_dialogs
+  post_opened
+}
+
+# In the opened post: tap the "N likes" line to show who liked it
+show_likers() {
+  local xy="" i
+  screenshot "16-post-opened.png"
+  for ((i=0; i<4; i++)); do
+    xy="$(ui_find likes '-' 0 || true)"
+    [[ -n "$xy" ]] && break
+    log "Explore: likes counter not visible yet, scrolling the post a little"
+    adb shell input swipe $((SCREEN_W/2)) $((SCREEN_H*70/100)) $((SCREEN_W/2)) $((SCREEN_H*42/100)) 500
+    sleep 2
+  done
+  if [[ -z "$xy" ]]; then
+    log "Explore: no likes counter in this post, going back"
+    adb shell input keyevent 4
+    sleep 3
+    dismiss_system_dialogs
+    return 1
+  fi
+  log "Explore: tapping the likes counter at $xy"
+  adb shell input tap $xy
+  sleep 4
+  dismiss_system_dialogs
+  screenshot "17-who-liked.png"
+  if ui_dump && grep -qi 'liked by' "$UI_XML"; then
+    log "EXPLORE OK: the 'Liked by' list is open"
+  else
+    log "WARNING: tapped the likes counter, but the 'Liked by' title was not detected (see screenshot 17)"
+  fi
+  adb shell input swipe $((SCREEN_W/2)) $((SCREEN_H*70/100)) $((SCREEN_W/2)) $((SCREEN_H*40/100)) 500
+  sleep 2
+  screenshot "18-who-liked-scrolled.png"
+  return 0
+}
+
+try_candidate() {
+  local x="$1" y="$2" sig="$3"
+  printf '%s\n' "$sig" >> "$TRIED_FILE"
+  open_post "$x" "$y" && show_likers
+}
+
+# No fresh post was found: use the best older candidate (newest, then most likes).
+# Scroll back up to it (checking every screen on the way) and open it.
+open_best_candidate() {
+  if [[ ! -s "$CAND_FILE" ]]; then
+    log "EXPLORE: no post within ${MAX_AGE_HOURS}h with more than ${MIN_LIKES} likes was found in ${SCAN_LAST} screen(s)"
+    return 1
+  fi
+  local line k age likes sig
+  line="$(sort -t $'\t' -k2,2n -k3,3nr "$CAND_FILE" | head -1)"
+  IFS=$'\t' read -r k age likes sig <<< "$line"
+  log "Explore: best candidate is $(fmt_age "$age") old with $likes likes (seen on scan screen $k, now on screen $SCAN_LAST)"
+
+  local steps=$(( SCAN_LAST - k )) limit j match x y
+  limit=$steps
+  (( k > 1 )) && limit=$(( steps + 1 ))
+  for ((j=0; j<=limit; j++)); do
+    dismiss_system_dialogs
+    match=""
+    if ui_dump; then
+      match="$(ui_posts | awk -F'\t' -v s="$sig" '$5==s{print $1 "\t" $2; exit}')"
+    fi
+    if [[ -n "$match" ]]; then
+      x="${match%%$'\t'*}"; y="${match##*$'\t'}"
+      log "Explore: found the post again"
+      try_candidate "$x" "$y" "$sig" && return 0
+      return 1
+    fi
+    (( j < limit )) && scroll_back
+  done
+  log "WARNING: could not find the best candidate again after scrolling back"
   return 1
 }
 
 explore_flow() {
   if [[ "$EXPLORE" != "1" ]]; then log "explore disabled (EXPLORE=$EXPLORE)"; return 0; fi
   read_screen_size
-  log "Explore: hashtag '$HASHTAG', posts up to ${MAX_AGE_HOURS}h old"
+  log "Explore: hashtag '$HASHTAG', tab '$RESULTS_TAB', max age ${MAX_AGE_HOURS}h (1d counts as 24h), more than $MIN_LIKES likes, fresh = up to ${FRESH_HOURS}h, scan up to $SCAN_SCREENS screens"
+  : > "$CAND_FILE"; : > "$TRIED_FILE"
+  SCAN_LAST=0; SCAN_SHOTS=0
 
   dismiss_popups 3
   ensure_app_foreground
@@ -654,18 +827,35 @@ explore_flow() {
   adb shell input keyevent 66
   sleep 6
   dismiss_system_dialogs
+
+  # 4. Results tab (Top is the default page; only switch when asked)
+  if [[ -n "$RESULTS_TAB" && "$RESULTS_TAB" != "Top" ]]; then
+    tap_text "^${RESULTS_TAB}\$" "" 4 || log "WARNING: tab '$RESULTS_TAB' not found, using the current results"
+    sleep 5
+    dismiss_system_dialogs
+  fi
   screenshot "14-search-results.png"
 
-  # 4. Latest tab (newest posts first)
-  if ! tap_text '^Latest$' "" 4; then
-    log "WARNING: Latest tab not found, using the current results"
-  fi
-  sleep 5
-  dismiss_system_dialogs
-  screenshot "15-latest-tab.png"
+  # 5. Scan while scrolling. Nothing is opened unless a post is recent AND has enough likes.
+  local i try
+  for ((i=1; i<=SCAN_SCREENS; i++)); do
+    SCAN_LAST=$i
+    for ((try=0; try<3; try++)); do
+      dismiss_system_dialogs
+      if ! ui_dump; then sleep 2; continue; fi
+      consider_screen "$i"
+      [[ -z "$FRESH_X" ]] && break
+      log "Explore: fresh candidate on screen $i (up to ${FRESH_HOURS}h old, more than $MIN_LIKES likes) -> opening it now"
+      if try_candidate "$FRESH_X" "$FRESH_Y" "$FRESH_SIG"; then return 0; fi
+      log "Explore: that post could not be used, checking the rest of this screen"
+      sleep 2
+    done
+    (( i < SCAN_SCREENS )) && scroll_feed
+  done
 
-  # 5. Recent post -> likes list
-  open_recent_post_likes
+  # 6. No fresh post: use the best older one
+  log "Explore: scan finished, no post within ${FRESH_HOURS}h qualified; looking at the best older one"
+  open_best_candidate
 }
 
 restore_flow() {
@@ -692,7 +882,7 @@ restore_flow() {
     log "RESTORE OK: the app opened already logged in"
 
     # extra steps, restore mode only: they never fail the restore
-    explore_flow || log "WARNING: the explore steps did not finish (see screenshots 12-17 and the log above)"
+    explore_flow || log "WARNING: the explore steps did not finish (see screenshots 12-18 and the log above)"
 
     if [[ "$RESAVE" == "1" ]]; then
       backup_and_upload || log "WARNING: refreshed backup was not created"
