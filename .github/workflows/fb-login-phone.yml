@@ -19,7 +19,7 @@ env:
 jobs:
   login:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,8 +31,35 @@ jobs:
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
 
-      - name: Record baseline IP (runner's own IP, no phone)
+      - name: Baseline IP (runner's own IP, before the phone)
         run: echo "BASELINE_IP=$(curl -s --max-time 20 https://ifconfig.me)" | tee -a $GITHUB_ENV
+
+      - name: Show available exit nodes
+        run: |
+          tailscale status
+          echo "---- exit nodes ----"
+          tailscale exit-node list || true
+
+      # From here on, ALL traffic on this runner (and therefore the whole emulator:
+      # SDK download, boot, Facebook install, login, Mega) goes through the phone.
+      - name: Route ALL traffic through my phone
+        run: |
+          sudo tailscale set --exit-node=$PHONE_IP --exit-node-allow-lan-access=true
+          sleep 8
+          tailscale status
+          tailscale ping -c 4 $PHONE_IP || true
+
+      - name: Verify IP changed (stop here if not)
+        run: |
+          NEW_IP=$(curl -s --max-time 30 https://ifconfig.me)
+          echo "Baseline IP: $BASELINE_IP"
+          echo "Phone IP:    $NEW_IP"
+          curl -s --max-time 20 "https://ipinfo.io/$NEW_IP/org" || true
+          echo
+          if [ -z "$NEW_IP" ] || [ "$NEW_IP" = "$BASELINE_IP" ]; then
+            echo "ERROR: traffic is NOT going through the phone"
+            exit 1
+          fi
 
       - name: Enable KVM
         run: |
@@ -40,11 +67,7 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
-      # Phone exit node is switched on inside this step, after the emulator boots, so the big
-      # Android SDK / system image download uses the runner's normal internet. Everything the
-      # Facebook script does (APK from Mega, login, backup upload) goes through the phone, and
-      # the script refuses to run or type credentials if the phone IP is not in use.
-      - name: Login (via phone) and back up
+      - name: Start emulator (on phone IP) and login
         uses: reactivecircus/android-emulator-runner@v2
         env:
           PHONE_IP: ${{ env.PHONE_IP }}
@@ -72,9 +95,7 @@ jobs:
           emulator-boot-timeout: 600
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-metrics
           disable-animations: true
-          script: |
-            bash scripts/use-phone-exit-node.sh
-            bash scripts/facebook-install-and-login.sh
+          script: bash scripts/facebook-install-and-login.sh
 
       - name: Upload screenshots and logs
         uses: actions/upload-artifact@v4
