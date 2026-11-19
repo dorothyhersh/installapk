@@ -27,12 +27,7 @@ if [ -n "${EXPECTED_PHONE_IP:-}" ] && [ "$CUR_IP" != "$EXPECTED_PHONE_IP" ]; the
   exit 1
 fi
 
-# 4) Best effort: show what the emulator itself sees (screenshot goes to artifacts)
-if command -v adb >/dev/null 2>&1; then
-  adb shell am start -a android.intent.action.VIEW -d https://ifconfig.me >/dev/null 2>&1 || true
-  sleep 10
-  adb exec-out screencap -p > "$ARTIFACTS/guard-emulator-ip.png" 2>/dev/null || true
-  adb shell input keyevent KEYCODE_HOME >/dev/null 2>&1 || true
-fi
+# (The old step that opened Chrome in the emulator was removed: it covered the Facebook
+# login screen with Chrome's first-run page and sent the emulator back to the home screen.)
 
 echo "[guard] OK: login may proceed through the phone IP $CUR_IP"
