@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # MODE=login   : install -> launch -> sign in -> dismiss popups -> switch to Page (verified) -> encrypted backup -> upload to Mega
 # MODE=restore : download backup from Mega -> install -> restore -> launch -> verify logged in
+#                (restore runs on the plain GitHub runner IP: no Tailscale, no phone exit node, no IP guard)
 # Env: APK_URL, PACKAGE_NAME (default com.facebook.katana), FB_IDENTIFIER, FB_PASSWORD,
 #      FB_PAGE_NAME (exact Page name, strongly recommended), FB_REQUIRE_PAGE (default 1),
 #      BACKUP_PASSPHRASE, RCLONE_CONF_CONTENT, MEGA_FOLDER, MEGA_FILE, MAKE_BACKUP, RESAVE
-# Phone exit node: PHONE_IP, BASELINE_IP, EXPECTED_PHONE_IP (optional) are used by the IP guard.
+# Phone exit node (LOGIN mode only): PHONE_IP, BASELINE_IP, EXPECTED_PHONE_IP (optional) are used
+# by the IP guard. RESTORE mode ignores all of these and just uses whatever IP the runner has.
 set -uo pipefail
 
 ROOT="${GITHUB_WORKSPACE:-$(pwd)}"
@@ -418,6 +420,10 @@ backup_session() {
 # The slow phone link is only needed for the login. Once the backup is made locally, switch the
 # exit node OFF so the Mega upload runs on the fast GitHub runner internet.
 switch_to_runner_ip() {
+  if [[ "$MODE" == "restore" ]]; then
+    log "restore mode: already on the runner IP, nothing to switch"
+    return 0
+  fi
   log "switching OFF the phone exit node: the Mega upload will use the fast runner internet"
   sudo tailscale set --exit-node= || { log "WARNING: could not clear the exit node"; return 1; }
   sleep 5
@@ -521,8 +527,24 @@ login_flow() {
   fi
 }
 
+# Log which profile the restored session opened as (Page name expected if the backup was made on the Page)
+log_restored_profile() {
+  local name
+  if tap_text '^Menu' "" 3; then
+    sleep 6; save_ui "restored-menu"; screenshot "12-restored-menu.png"
+    name="$(menu_profile_name)"
+    log "restored session profile: '${name:-unknown}'"
+    if [[ -n "${FB_PAGE_NAME:-}" ]]; then
+      if [[ "${name,,}" == "${FB_PAGE_NAME,,}" ]]; then log "RESTORED AS PAGE OK ($name)"
+      else log "WARNING: restored profile is '${name:-unknown}', expected Page '${FB_PAGE_NAME}'"; fi
+    fi
+  else
+    log "could not open Menu to check the restored profile"
+  fi
+}
+
 restore_flow() {
-  phone_guard || return 1
+  # No phone guard here: restore runs on the GitHub runner IP by design
   log "starting the app once so its data folder exists"
   launch_app; sleep 10; dismiss_system_dialogs
   adb shell am force-stop "$PACKAGE_NAME"; sleep 1
@@ -533,6 +555,7 @@ restore_flow() {
   screenshot "11-restored-after-dismiss.png"
   if is_logged_in; then
     log "RESTORE OK: Facebook opened already logged in"
+    log_restored_profile
     [[ "$RESAVE" == "1" ]] && { backup_and_upload || log "WARNING: refreshed backup not created"; }
     return 0
   fi
@@ -543,8 +566,13 @@ restore_flow() {
 # ===================== MAIN =====================
 log "mode: $MODE"
 
-# Refuse to do anything (APK download, Mega, login) unless the phone exit node is active
-phone_guard || exit 1
+# LOGIN mode: refuse to do anything unless the phone exit node is active.
+# RESTORE mode: runs on the plain GitHub runner IP, no exit node, no guard.
+if [[ "$MODE" == "restore" ]]; then
+  log "restore mode: using the GitHub runner IP (no phone exit node, no IP guard)"
+else
+  phone_guard || exit 1
+fi
 
 adb devices -l
 APK_MEGA_FILE="${APK_MEGA_FILE:-}"
