@@ -69,6 +69,8 @@ jobs:
           MAKE_BACKUP: "1"
           FB_IDENTIFIER: ${{ secrets.FB_IDENTIFIER }}
           FB_PASSWORD: ${{ secrets.FB_PASSWORD }}
+          FB_PAGE_NAME: ${{ secrets.FB_PAGE_NAME }}
+          FB_REQUIRE_PAGE: "1"
           BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
           RCLONE_CONF_CONTENT: ${{ secrets.RCLONE_CONF }}
           MEGA_FOLDER: facebook-android-backup
