@@ -697,14 +697,50 @@ if best:
 PY
 }
 
+# Taps OK on the "Couldn't play video" dialog if it is showing. Returns 0 if a dialog was dismissed.
+# (The emulator cannot decode the preview, so Facebook shows this dialog. It is harmless for
+# posting: we only dismiss it and move on. We NEVER tap the preview / play area.)
+dismiss_play_error() {
+  local xy
+  grep -qiE "Couldn.t play video" "$UI_XML" || return 1
+  xy="$(ui_query text '^OK$' 0 || true)"
+  [[ -n "$xy" ]] || xy="883 1255"
+  log "dismissing 'Couldn't play video' dialog (OK at $xy)"
+  adb shell input tap $xy; sleep 2
+  return 0
+}
+
+# On the "Edit reel" screen: wait for the gallery tap to open it, dismiss any "Couldn't play video"
+# dialog (as many times as it shows up) and tap Next. Never plays the video.
+# Returns 0 = Next tapped, 1 = Next never appeared, 3 = Next never appeared and the play error was seen.
+advance_past_edit_screen() {
+  local idx="$1" i xy seen_err=0
+  for ((i=0; i<30; i++)); do
+    ui_dump || { sleep 2; continue; }
+    if dismiss_play_error; then seen_err=1; continue; fi
+    xy="$(ui_query text '^Next$' 0 || true)"
+    if [[ -n "$xy" ]]; then
+      if (( seen_err )); then screenshot "r${idx}-02b-after-dialog.png"; fi
+      log "tap Next at $xy (video is NOT played)"
+      adb shell input tap $xy; sleep 4
+      return 0
+    fi
+    sleep 2
+  done
+  screenshot "r${idx}-02c-no-next.png"; save_ui "r${idx}-no-next"
+  log "ERROR: Next button not found on the Edit reel screen"
+  if (( seen_err )); then return 3; fi
+  return 1
+}
+
 # Full composer flow for one reel: + -> Reel -> pick video -> Next* -> caption -> Share.
 # Return codes:
 #   0 = shared OK
 #   1 = this video failed (retryable, left in MEGA_REELS_SRC)
 #   2 = a structural step failed (same for every video, so the caller stops the whole loop)
-#   3 = Facebook could not play the video in the emulator (counts toward MAX_PLAYBACK_FAILS)
+#   3 = Next never appeared and Facebook kept showing "Couldn't play video" (counts toward MAX_PLAYBACK_FAILS)
 compose_one_reel() {
-  local idx="$1" caption="$2" xy ok=0 i
+  local idx="$1" caption="$2" xy ok=0 i rc
 
   # feed -> tap + -> "Post / Story / Reel / Live" menu
   tap_text '^(Create|Add)$' "780 119" 4 || { log "ERROR: create (+) button not found"; return 2; }
@@ -723,29 +759,24 @@ compose_one_reel() {
 
   xy="$(pick_single_video_thumb || true)"
   [[ -n "$xy" ]] || { log "ERROR: video thumbnail not found in the gallery grid (see r${idx}-01-create-reel-gallery.png)"; return 1; }
-  log "tap video thumbnail at $xy"; adb shell input tap $xy; sleep 8
+  log "tap video thumbnail at $xy"; adb shell input tap $xy; sleep 2
 
-  # Picking the video opens the "Edit reel" screen (Audio/Text/Effects/Stickers/Save, -> Next)
+  # Picking the video opens the "Edit reel" screen. The emulator usually cannot play the preview and
+  # Facebook shows "Couldn't play video": dismiss it with OK and go straight to Next.
+  sleep 3
   screenshot "r${idx}-02-edit-reel.png"; save_ui "r${idx}-edit-reel"
-  log "texts in Edit reel:"; ui_texts | head -30 | sed 's/^/[fb]   /'
+  advance_past_edit_screen "$idx"; rc=$?
+  (( rc == 0 )) || return "$rc"
 
-  # Fail fast if the emulator could not decode the video
-  if grep -qiE "Couldn.t play video" "$UI_XML"; then
-    log "ERROR: Facebook could not play this video in the emulator (codec / GPU issue)"
-    return 3
-  fi
-
-  xy="$(ui_find text '^Next$' 0 || true)"
-  [[ -n "$xy" ]] || { log "ERROR: Next button not found on the Edit reel screen"; return 1; }
-  log "tap Next at $xy"; adb shell input tap $xy; sleep 5
-
-  # If there's a second "Next" screen before Reel Settings, step through it too (usually none)
-  for i in 1 2; do
-    ui_dump || true
+  # Wait for "Reel Settings". On the way: dismiss any playback-error dialog again, and step through
+  # an extra Next screen if there is one.
+  for i in $(seq 1 15); do
+    ui_dump || { sleep 2; continue; }
     grep -qi 'Describe your reel' "$UI_XML" && break
+    if dismiss_play_error; then continue; fi
     xy="$(ui_query text '^Next$' 0 || true)"
-    [[ -z "$xy" ]] && break
-    log "tap Next ($((i+1))) at $xy"; adb shell input tap $xy; sleep 4
+    if [[ -n "$xy" ]]; then log "tap Next (extra screen $i) at $xy"; adb shell input tap $xy; sleep 4; continue; fi
+    sleep 3
   done
 
   # "Reel Settings" screen: caption placeholder "Describe your reel. You can also add
