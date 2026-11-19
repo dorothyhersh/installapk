@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# MODE=login   : install -> launch -> sign in -> dismiss popups -> encrypted backup -> upload to Mega
+# MODE=login   : install -> launch -> sign in -> dismiss popups -> switch to Page (verified) -> encrypted backup -> upload to Mega
 # MODE=restore : download backup from Mega -> install -> restore -> launch -> verify logged in
 # Env: APK_URL, PACKAGE_NAME (default com.facebook.katana), FB_IDENTIFIER, FB_PASSWORD,
+#      FB_PAGE_NAME (exact Page name, strongly recommended), FB_REQUIRE_PAGE (default 1),
 #      BACKUP_PASSPHRASE, RCLONE_CONF_CONTENT, MEGA_FOLDER, MEGA_FILE, MAKE_BACKUP, RESAVE
 # Phone exit node: PHONE_IP, BASELINE_IP, EXPECTED_PHONE_IP (optional) are used by the IP guard.
 set -uo pipefail
@@ -231,10 +232,15 @@ dismiss_popups() {
   done
 }
 
-# Logged in = no login form / no "Create new account" button, and the main feed UI is present
+# True when the profile switcher bottom sheet is on screen (uses the latest ui dump)
+switcher_open() { grep -qiE 'Create Facebook Page|Open Accounts Center' "$UI_XML"; }
+
+# Logged in = no login form / no "Create new account" button, the main feed UI is present,
+# and the profile switcher sheet is NOT covering it (the feed is visible behind the dimmed sheet)
 is_logged_in() {
   ui_dump || return 1
   ! grep -qiE 'Create new account|Forgot password|Log in to Facebook' "$UI_XML" \
+    && ! switcher_open \
     && grep -qiE 'Home|What.s on your mind|Notifications|Menu' "$UI_XML"
 }
 
@@ -255,28 +261,45 @@ for n in ET.parse(sys.argv[1]).getroot().iter('node'):
 PY
 }
 
-# Heuristic when FB_PAGE_NAME is not set: the 1st entry in the switcher is the current (main)
-# profile, so pick the 2nd entry. Setting FB_PAGE_NAME is more reliable.
-pick_other_profile() {
-  python3 - "$UI_XML" <<'PY'
+# Name shown in the Menu header, e.g. "Hollie Wells, see your profile" -> "Hollie Wells"
+menu_profile_name() {
+  ui_texts | sed -n 's/^[0-9]* [0-9]* \(.*\), see your profile$/\1/p' | head -1
+}
+
+# Finds the Page row inside the profile switcher bottom sheet (y >= 1300 only, so Menu items
+# behind the sheet and the top header never match).
+#  - with a name: exact (case-insensitive) text match
+#  - without a name: the row sitting just above a "Page" badge
+# Never uses position in the list, so "Dismiss" / the checked main profile cannot be picked.
+pick_page_row() {
+  python3 - "$UI_XML" "${1:-}" <<'PY'
 import re, sys, xml.etree.ElementTree as ET
-skip = re.compile(r'(add|create|settings|close|cancel|switch|see more|log ?out|manage|your profile|profiles?$|accounts?$|^\W*$)', re.I)
-seen = []
-for n in ET.parse(sys.argv[1]).getroot().iter('node'):
+path, name = sys.argv[1], sys.argv[2]
+rows = []
+for n in ET.parse(path).getroot().iter('node'):
     a = n.attrib
     t = (a.get('text') or a.get('content-desc') or '').strip()
     m = re.findall(r'\d+', a.get('bounds', ''))
-    if not t or len(m) != 4 or skip.search(t):
+    if not t or len(m) != 4:
         continue
     x1, y1, x2, y2 = map(int, m)
-    if y1 < 500 or y2 > 2150:
+    if y1 < 1300:
         continue
-    if t in [s[2] for s in seen]:
+    rows.append(((x1 + x2) // 2, (y1 + y2) // 2, t))
+if name:
+    for x, y, t in rows:
+        if t.lower() == name.lower():
+            print(x, y)
+            break
+    sys.exit(0)
+for bx, by, bt in rows:
+    if bt.lower() != 'page':
         continue
-    seen.append(((x1 + x2) // 2, (y1 + y2) // 2, t))
-seen.sort(key=lambda s: s[1])
-if len(seen) >= 2:
-    print(seen[1][0], seen[1][1])
+    c = [r for r in rows if r[1] < by and by - r[1] <= 120 and r[2].lower() != 'page']
+    if c:
+        r = max(c, key=lambda r: r[1])
+        print(r[0], r[1])
+        break
 PY
 }
 
@@ -305,39 +328,68 @@ post_login_prompts() {
   return 1
 }
 
-# Feed -> Menu -> profile switcher -> Page
+# Feed -> Menu -> profile switcher -> Page, then VERIFY the Menu header shows the Page.
+# Returns 0 only when the switch is confirmed. Retries once.
 switch_to_page() {
-  local page="${FB_PAGE_NAME:-}" xy esc
+  local page="${FB_PAGE_NAME:-}" xy main_name now_name attempt
   log "opening Menu to switch from the main profile to the Page ${page:+($page)}"
   dismiss_popups 2
   tap_text '^Menu' "" 4 || { screenshot "09b-no-menu.png"; save_ui "no-menu"; log "ERROR: Menu tab not found"; return 1; }
   sleep 6
   screenshot "10-menu.png"; save_ui "menu"
   log "texts visible in Menu:"; ui_texts | head -40 | sed 's/^/[fb]   /'
+  main_name="$(menu_profile_name)"
+  log "profile before switch: '${main_name:-unknown}'"
 
-  xy="$(ui_query text '(Switch profile|Switch account|Profile switcher|Switch to)' 0 || true)"
-  if [[ -z "$xy" ]]; then
-    log "ERROR: profile switcher not found in Menu (see 10-menu.png and ui-menu.xml in the artifacts)"
-    return 1
-  fi
-  log "tap profile switcher at $xy"; adb shell input tap $xy; sleep 5
-  screenshot "11-switcher.png"; save_ui "switcher"
-  log "texts visible in the switcher:"; ui_texts | head -40 | sed 's/^/[fb]   /'
+  for attempt in 1 2; do
+    # If a previous attempt left the sheet open, close it first
+    ui_dump || true
+    if switcher_open; then log "closing leftover switcher sheet"; adb shell input keyevent 4; sleep 3; ui_dump || true; fi
+    # Make sure the Menu is open
+    if ! grep -qiE 'see your profile|Settings and privacy' "$UI_XML"; then
+      tap_text '^Menu' "" 3 || true
+      sleep 6
+    fi
 
-  if [[ -n "$page" ]]; then
-    esc="$(python3 -c 'import re,sys; print(re.escape(sys.argv[1]))' "$page")"
-    xy="$(ui_query text "$esc" 0 || true)"
-  else
-    log "FB_PAGE_NAME not set: using the 2nd entry in the switcher as the Page"
-    xy="$(pick_other_profile || true)"
-  fi
-  [[ -n "$xy" ]] || { log "ERROR: Page not found in the switcher (set the FB_PAGE_NAME secret to the exact Page name)"; return 1; }
-  log "tap Page at $xy"; adb shell input tap $xy; sleep 15
-  dismiss_system_dialogs
-  post_login_prompts 4 || true
-  screenshot "12-after-page-switch.png"; save_ui "after-switch"
-  is_logged_in || { log "ERROR: feed not visible after switching to the Page"; return 1; }
-  log "PAGE SWITCH DONE"
+    xy="$(ui_find text '(Profile switcher|Switch profile|Switch account)' 0 || true)"
+    if [[ -z "$xy" ]]; then
+      log "ERROR: profile switcher button not found in Menu (see 10-menu.png and ui-menu.xml)"
+      return 1
+    fi
+    log "attempt $attempt: tap profile switcher at $xy"; adb shell input tap $xy; sleep 5
+    screenshot "11-switcher-$attempt.png"; save_ui "switcher-$attempt"
+    log "texts visible in the switcher:"; ui_texts | head -40 | sed 's/^/[fb]   /'
+
+    xy="$(pick_page_row "$page" || true)"
+    if [[ -z "$xy" ]]; then
+      log "ERROR: Page row not found in the switcher (set the FB_PAGE_NAME secret to the exact Page name)"
+      return 1
+    fi
+    log "tap Page row at $xy"; adb shell input tap $xy; sleep 15
+    dismiss_system_dialogs
+    post_login_prompts 4 || true
+    screenshot "12-after-page-switch-$attempt.png"; save_ui "after-switch-$attempt"
+
+    # VERIFY 1: the switcher sheet must be gone
+    ui_dump || true
+    if switcher_open; then log "switch check failed: switcher still open"; continue; fi
+
+    # VERIFY 2: the Menu header must show the Page, not the main profile
+    if ! tap_text '^Menu' "" 4; then log "switch check failed: could not open Menu to verify"; continue; fi
+    sleep 6
+    save_ui "verify-menu-$attempt"
+    screenshot "13-verify-menu-$attempt.png"
+    now_name="$(menu_profile_name)"
+    log "profile after switch: '${now_name:-unknown}'"
+    if [[ -n "$page" ]]; then
+      if [[ "${now_name,,}" == "${page,,}" ]]; then log "PAGE SWITCH VERIFIED ($now_name)"; return 0; fi
+    else
+      if [[ -n "$now_name" && "$now_name" != "$main_name" ]]; then log "PAGE SWITCH VERIFIED ($now_name)"; return 0; fi
+    fi
+    log "switch check failed: still on '${now_name:-unknown}'"
+  done
+  log "ERROR: could not verify the switch to the Page"
+  return 1
 }
 
 # ---------------- Backup / restore (needs adb root) ----------------
