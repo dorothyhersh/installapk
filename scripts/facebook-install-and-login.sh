@@ -349,10 +349,31 @@ restore_flow() {
 # ===================== MAIN =====================
 log "mode: $MODE"
 adb devices -l
-[[ -n "$APK_URL" ]] || { log "APK_URL is empty"; exit 1; }
-log "downloading APK"
-curl -L --fail --retry 3 --connect-timeout 20 -o "$APK_FILE" "$APK_URL" || { log "ERROR: download failed"; exit 1; }
-[[ "$(head -c 2 "$APK_FILE")" == "PK" ]] || { log "ERROR: not an APK (HTML page? use a direct .apk link)"; exit 1; }
+APK_MEGA_FILE="${APK_MEGA_FILE:-}"
+if [[ -n "$APK_URL" ]]; then
+  log "downloading APK from URL"
+  curl -L --fail --retry 3 --connect-timeout 20 -o "$APK_FILE" "$APK_URL" || { log "ERROR: download failed"; exit 1; }
+elif [[ -n "$APK_MEGA_FILE" ]]; then
+  log "downloading APK set from Mega: $APK_MEGA_FILE"
+  setup_rclone || { log "ERROR: rclone/Mega not ready"; exit 1; }
+  rclone copyto "${MEGA_REMOTE}:${APK_MEGA_FILE}" "$APK_FILE" --retries 5 -q \
+    || { log "ERROR: APK not found in Mega at ${APK_MEGA_FILE}"; exit 1; }
+else
+  log "ERROR: set APK_URL or APK_MEGA_FILE"; exit 1
+fi
+[[ "$(head -c 2 "$APK_FILE")" == "PK" ]] || { log "ERROR: not an APK or zip (HTML page? use a direct link)"; exit 1; }
+
+# A single APK contains AndroidManifest.xml. Otherwise treat the file as a zip of split APKs
+# (base.apk + split_config.*.apk pulled from a phone).
+APK_LIST=("$APK_FILE")
+if ! unzip -l "$APK_FILE" 2>/dev/null | grep -q 'AndroidManifest.xml'; then
+  SPLIT_DIR="${RUNNER_TEMP:-/tmp}/fb-splits"
+  rm -rf "$SPLIT_DIR"; mkdir -p "$SPLIT_DIR"
+  unzip -q -o "$APK_FILE" -d "$SPLIT_DIR" || { log "ERROR: cannot unzip the download"; exit 1; }
+  mapfile -t APK_LIST < <(find "$SPLIT_DIR" -name '*.apk' | sort)
+  (( ${#APK_LIST[@]} > 0 )) || { log "ERROR: no .apk files inside the zip"; exit 1; }
+  log "split APK set: ${#APK_LIST[@]} file(s)"
+fi
 
 if [[ "$MODE" == "restore" ]]; then
   mega_download || { log "ERROR: could not download backup"; exit 1; }
@@ -364,9 +385,16 @@ sleep 20
 dismiss_system_dialogs
 screenshot "00-home-screen.png"
 
+log "emulator CPU ABIs: $(adb_sh getprop ro.product.cpu.abilist)"
 log "installing APK"
-if ! adb install -r -t -g "$APK_FILE"; then
-  adb install -r -t -g -d "$APK_FILE" || { log "ERROR: install failed (ABI mismatch? Facebook ships split APK/bundles)"; exit 1; }
+if (( ${#APK_LIST[@]} > 1 )); then
+  adb install-multiple -r -t -g "${APK_LIST[@]}" \
+    || adb install-multiple -r -t -g -d "${APK_LIST[@]}" \
+    || { log "ERROR: install-multiple failed (arm64-only build on an x86_64 emulator?)"; exit 1; }
+else
+  adb install -r -t -g "${APK_LIST[0]}" \
+    || adb install -r -t -g -d "${APK_LIST[0]}" \
+    || { log "ERROR: install failed (ABI mismatch?)"; exit 1; }
 fi
 adb shell pm list packages | grep -F "$PACKAGE_NAME" || { log "ERROR: package not installed"; exit 1; }
 sleep 2
