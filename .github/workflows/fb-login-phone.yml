@@ -31,35 +31,8 @@ jobs:
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
 
-      - name: Baseline IP (runner's own IP, before the phone)
+      - name: Record baseline IP (runner's own IP, before the phone)
         run: echo "BASELINE_IP=$(curl -s --max-time 20 https://ifconfig.me)" | tee -a $GITHUB_ENV
-
-      - name: Show available exit nodes
-        run: |
-          tailscale status
-          echo "---- exit nodes ----"
-          tailscale exit-node list || true
-
-      # From here on, ALL traffic on this runner (and therefore the whole emulator:
-      # SDK download, boot, Facebook install, login, Mega) goes through the phone.
-      - name: Route ALL traffic through my phone
-        run: |
-          sudo tailscale set --exit-node=$PHONE_IP --exit-node-allow-lan-access=true
-          sleep 8
-          tailscale status
-          tailscale ping -c 4 $PHONE_IP || true
-
-      - name: Verify IP changed (stop here if not)
-        run: |
-          NEW_IP=$(curl -s --max-time 30 https://ifconfig.me)
-          echo "Baseline IP: $BASELINE_IP"
-          echo "Phone IP:    $NEW_IP"
-          curl -s --max-time 20 "https://ipinfo.io/$NEW_IP/org" || true
-          echo
-          if [ -z "$NEW_IP" ] || [ "$NEW_IP" = "$BASELINE_IP" ]; then
-            echo "ERROR: traffic is NOT going through the phone"
-            exit 1
-          fi
 
       - name: Enable KVM
         run: |
@@ -67,7 +40,13 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
-      - name: Start emulator (on phone IP) and login
+      # ORDER INSIDE THIS STEP:
+      #  1) action installs SDK + boots emulator          -> runner internet (fast)
+      #  2) download-apk.sh downloads the Facebook zip    -> runner internet (fast)
+      #  3) use-phone-exit-node.sh switches to the phone  -> from here on Telenor exit node IP
+      #  4) facebook-install-and-login.sh installs the APK, launches Facebook and logs in
+      #     -> all on the Telenor exit node IP (it also refuses to type credentials otherwise)
+      - name: Start emulator, download zip, switch to phone IP, install and login
         uses: reactivecircus/android-emulator-runner@v2
         env:
           PHONE_IP: ${{ env.PHONE_IP }}
@@ -95,7 +74,26 @@ jobs:
           emulator-boot-timeout: 600
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-metrics
           disable-animations: true
-          script: bash scripts/facebook-install-and-login.sh
+          script: |
+            echo "[$(date -u +%T)] STEP 1 DONE: emulator is installed and fully booted"
+            adb devices -l
+            echo "[$(date -u +%T)] STEP 2: downloading the zip on the runner internet"
+            timeout 1000 bash scripts/download-apk.sh
+            echo "[$(date -u +%T)] STEP 3: switching to the phone (Telenor) exit node"
+            timeout 300 bash scripts/use-phone-exit-node.sh
+            echo "[$(date -u +%T)] public IP now: $(curl -s --max-time 30 https://ifconfig.me)"
+            echo "[$(date -u +%T)] STEP 4: install APK, launch Facebook and login on the phone IP"
+            bash scripts/facebook-install-and-login.sh
+            echo "[$(date -u +%T)] ALL DONE"
+
+      - name: Print all logs
+        if: always()
+        run: |
+          echo "=== tailscale status ==="; tailscale status || true
+          echo "=== public IP now ==="; curl -s --max-time 20 https://ifconfig.me || true; echo
+          echo "=== run.log (everything the Facebook script did) ==="; cat artifacts/run.log 2>/dev/null || echo "no run.log (script never started)"
+          echo "=== artifacts ==="; ls -la artifacts/ 2>/dev/null || echo "no artifacts folder"
+          echo "=== logcat (last 200 lines) ==="; tail -n 200 artifacts/logcat.txt 2>/dev/null || echo "no logcat"
 
       - name: Upload screenshots and logs
         uses: actions/upload-artifact@v4
