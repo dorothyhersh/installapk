@@ -29,10 +29,10 @@ jobs:
 
       - name: Route traffic through my phone
         run: |
-          sudo tailscale set --exit-node=100.85.72.32 --exit-node-allow-lan-access=true
+          sudo tailscale set --exit-node=100.123.203.47 --exit-node-allow-lan-access=true
           sleep 8
           tailscale status
-          tailscale ping -c 4 100.85.72.32 || true
+          tailscale ping -c 4 100.123.203.47 || true
 
       - name: Verify IP changed
         run: |
