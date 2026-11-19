@@ -3,6 +3,7 @@
 # MODE=restore : download backup from Mega -> install -> restore -> launch -> verify logged in
 # Env: APK_URL, PACKAGE_NAME (default com.facebook.katana), FB_IDENTIFIER, FB_PASSWORD,
 #      BACKUP_PASSPHRASE, RCLONE_CONF_CONTENT, MEGA_FOLDER, MEGA_FILE, MAKE_BACKUP, RESAVE
+# Phone exit node: PHONE_IP, BASELINE_IP, EXPECTED_PHONE_IP (optional) are used by the IP guard.
 set -uo pipefail
 
 ROOT="${GITHUB_WORKSPACE:-$(pwd)}"
@@ -52,6 +53,16 @@ finish() {
   exit "$code"
 }
 trap finish EXIT
+
+# ---------------- Phone exit-node guard ----------------
+# Fail-closed: if traffic is not leaving through the phone, refuse to continue.
+phone_guard() {
+  if [[ -z "${PHONE_IP:-}" ]]; then
+    log "ABORT: PHONE_IP is not set; refusing to run without the phone exit node"
+    return 1
+  fi
+  bash "${ROOT}/scripts/assert-phone-ip.sh" || { log "ABORT: not on the phone IP, refusing to continue"; return 1; }
+}
 
 wait_for_boot() {
   adb wait-for-device
@@ -281,6 +292,10 @@ login_flow() {
   if [[ -z "$FB_IDENTIFIER" || -z "$FB_PASSWORD" ]]; then
     log "login skipped: FB_IDENTIFIER / FB_PASSWORD secrets are empty"; return 1
   fi
+
+  # Never type credentials unless traffic is leaving through the phone exit node
+  phone_guard || return 1
+
   dismiss_system_dialogs
   sleep 5
   dismiss_popups 2   # language / permission prompts
@@ -301,6 +316,10 @@ login_flow() {
   screenshot "06-password-entered.png"   # password is masked
 
   adb shell input keyevent 4 >/dev/null 2>&1; sleep 1   # hide keyboard so the button is visible
+
+  # Re-check right before submitting, in case the exit node dropped while typing
+  phone_guard || return 1
+
   tap_text '^Log ?in$' "" 3 || adb shell input keyevent 66
   sleep 15
   dismiss_system_dialogs
@@ -329,6 +348,7 @@ login_flow() {
 }
 
 restore_flow() {
+  phone_guard || return 1
   log "starting the app once so its data folder exists"
   launch_app; sleep 10; dismiss_system_dialogs
   adb shell am force-stop "$PACKAGE_NAME"; sleep 1
@@ -348,6 +368,10 @@ restore_flow() {
 
 # ===================== MAIN =====================
 log "mode: $MODE"
+
+# Refuse to do anything (APK download, Mega, login) unless the phone exit node is active
+phone_guard || exit 1
+
 adb devices -l
 APK_MEGA_FILE="${APK_MEGA_FILE:-}"
 if [[ -n "$APK_URL" ]]; then
