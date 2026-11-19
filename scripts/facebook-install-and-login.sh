@@ -238,6 +238,108 @@ is_logged_in() {
     && grep -qiE 'Home|What.s on your mind|Notifications|Menu' "$UI_XML"
 }
 
+# ---------------- Post-login prompts, Menu and Page switch ----------------
+save_ui() { ui_dump && cp "$UI_XML" "$ARTIFACTS/ui-$1.xml" 2>/dev/null || true; }
+
+# prints "x y text" for every visible node that has text, so the log shows what is on screen
+ui_texts() {
+  python3 - "$UI_XML" <<'PY'
+import re, sys, xml.etree.ElementTree as ET
+for n in ET.parse(sys.argv[1]).getroot().iter('node'):
+    a = n.attrib
+    t = (a.get('text') or a.get('content-desc') or '').strip()
+    m = re.findall(r'\d+', a.get('bounds', ''))
+    if t and len(m) == 4:
+        x1, y1, x2, y2 = map(int, m)
+        print(f"{(x1 + x2) // 2} {(y1 + y2) // 2} {t}")
+PY
+}
+
+# Heuristic when FB_PAGE_NAME is not set: the 1st entry in the switcher is the current (main)
+# profile, so pick the 2nd entry. Setting FB_PAGE_NAME is more reliable.
+pick_other_profile() {
+  python3 - "$UI_XML" <<'PY'
+import re, sys, xml.etree.ElementTree as ET
+skip = re.compile(r'(add|create|settings|close|cancel|switch|see more|log ?out|manage|your profile|profiles?$|accounts?$|^\W*$)', re.I)
+seen = []
+for n in ET.parse(sys.argv[1]).getroot().iter('node'):
+    a = n.attrib
+    t = (a.get('text') or a.get('content-desc') or '').strip()
+    m = re.findall(r'\d+', a.get('bounds', ''))
+    if not t or len(m) != 4 or skip.search(t):
+        continue
+    x1, y1, x2, y2 = map(int, m)
+    if y1 < 500 or y2 > 2150:
+        continue
+    if t in [s[2] for s in seen]:
+        continue
+    seen.append(((x1 + x2) // 2, (y1 + y2) // 2, t))
+seen.sort(key=lambda s: s[1])
+if len(seen) >= 2:
+    print(seen[1][0], seen[1][1])
+PY
+}
+
+# After login: "Continue in English (US)" -> "Skip" / "Not now" ... until the feed shows
+post_login_prompts() {
+  local rounds="${1:-12}" i xy handled
+  for ((i=0; i<rounds; i++)); do
+    dismiss_system_dialogs
+    if is_logged_in; then log "feed detected"; return 0; fi
+    handled=0
+    xy="$(ui_query text '^Continue in English' 0 || true)"
+    if [[ -n "$xy" ]]; then
+      log "language prompt: tapping 'Continue in English (US)' at $xy"
+      adb shell input tap $xy; handled=1; sleep 5
+    else
+      xy="$(ui_query text '^Skip$' 0 || true)"
+      if [[ -n "$xy" ]]; then
+        log "tapping 'Skip' at $xy"; adb shell input tap $xy; handled=1; sleep 5
+      else
+        xy="$(ui_query text "$DISMISS_REGEX" 0 || true)"
+        if [[ -n "$xy" ]]; then log "popup, tapping dismiss at $xy"; adb shell input tap $xy; handled=1; sleep 4; fi
+      fi
+    fi
+    if [[ "$handled" == "0" ]]; then log "no prompt to tap (round $((i+1))/$rounds), waiting"; sleep 4; fi
+  done
+  return 1
+}
+
+# Feed -> Menu -> profile switcher -> Page
+switch_to_page() {
+  local page="${FB_PAGE_NAME:-}" xy esc
+  log "opening Menu to switch from the main profile to the Page ${page:+($page)}"
+  dismiss_popups 2
+  tap_text '^Menu' "" 4 || { screenshot "09b-no-menu.png"; save_ui "no-menu"; log "ERROR: Menu tab not found"; return 1; }
+  sleep 6
+  screenshot "10-menu.png"; save_ui "menu"
+  log "texts visible in Menu:"; ui_texts | head -40 | sed 's/^/[fb]   /'
+
+  xy="$(ui_query text '(Switch profile|Switch account|Profile switcher|Switch to)' 0 || true)"
+  if [[ -z "$xy" ]]; then
+    log "ERROR: profile switcher not found in Menu (see 10-menu.png and ui-menu.xml in the artifacts)"
+    return 1
+  fi
+  log "tap profile switcher at $xy"; adb shell input tap $xy; sleep 5
+  screenshot "11-switcher.png"; save_ui "switcher"
+  log "texts visible in the switcher:"; ui_texts | head -40 | sed 's/^/[fb]   /'
+
+  if [[ -n "$page" ]]; then
+    esc="$(python3 -c 'import re,sys; print(re.escape(sys.argv[1]))' "$page")"
+    xy="$(ui_query text "$esc" 0 || true)"
+  else
+    log "FB_PAGE_NAME not set: using the 2nd entry in the switcher as the Page"
+    xy="$(pick_other_profile || true)"
+  fi
+  [[ -n "$xy" ]] || { log "ERROR: Page not found in the switcher (set the FB_PAGE_NAME secret to the exact Page name)"; return 1; }
+  log "tap Page at $xy"; adb shell input tap $xy; sleep 15
+  dismiss_system_dialogs
+  post_login_prompts 4 || true
+  screenshot "12-after-page-switch.png"; save_ui "after-switch"
+  is_logged_in || { log "ERROR: feed not visible after switching to the Page"; return 1; }
+  log "PAGE SWITCH DONE"
+}
+
 # ---------------- Backup / restore (needs adb root) ----------------
 need_root() {
   adb root >/dev/null 2>&1; sleep 3; adb wait-for-device
@@ -261,8 +363,18 @@ backup_session() {
   log "encrypted backup created ($(stat -c%s "$BACKUP_FILE") bytes)"
 }
 
+# The slow phone link is only needed for the login. Once the backup is made locally, switch the
+# exit node OFF so the Mega upload runs on the fast GitHub runner internet.
+switch_to_runner_ip() {
+  log "switching OFF the phone exit node: the Mega upload will use the fast runner internet"
+  sudo tailscale set --exit-node= || { log "WARNING: could not clear the exit node"; return 1; }
+  sleep 5
+  log "public IP now: $(curl -s --max-time 30 https://ifconfig.me || echo unknown)  (runner baseline: ${BASELINE_IP:-unknown})"
+}
+
 backup_and_upload() {
   backup_session || return 1
+  switch_to_runner_ip || log "WARNING: still on the phone link, the upload may be slow"
   mega_upload || log "WARNING: backup created but NOT uploaded to Mega"
 }
 
@@ -332,15 +444,25 @@ login_flow() {
   fi
 
   sleep 10
-  # "Save your login info?" -> Save/OK keeps the session; other prompts get dismissed
+  # "Save your login info?" -> Save keeps the session
   tap_text '^(Save|OK)$' "" 1 || true
   sleep 3
-  dismiss_popups 5
+  # Then: "Continue in English (US)" -> "Skip" / "Not now" ... until the feed appears
+  post_login_prompts 12 || true
   screenshot "08-after-popups.png"
 
   if is_logged_in; then
     log "LOGIN OK (feed is visible)"
-    [[ "$MAKE_BACKUP" == "1" ]] && { backup_and_upload || log "WARNING: backup not created"; launch_app; sleep 6; }
+    screenshot "09-feed.png"
+    local page_ok=0
+    switch_to_page && page_ok=1
+    if [[ "$page_ok" == "0" && "${FB_REQUIRE_PAGE:-1}" == "1" ]]; then
+      log "ERROR: could not switch to the Page, NOT creating a backup (set FB_REQUIRE_PAGE=0 to back up the main profile anyway)"
+      return 1
+    fi
+    # backup (local) -> switch to runner IP -> fast Mega upload. The app is NOT relaunched afterwards,
+    # so Facebook never sees the runner IP right after the phone IP login.
+    [[ "$MAKE_BACKUP" == "1" ]] && { backup_and_upload || log "WARNING: backup not created"; }
   else
     log "WARNING: feed not detected, NOT creating a backup (a good old backup is never replaced by a bad one)"
     return 1
