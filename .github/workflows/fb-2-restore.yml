@@ -69,7 +69,7 @@ jobs:
           ram-size: 3072M
           force-avd-creation: true
           emulator-boot-timeout: 600
-          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-metrics
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-metrics -feature -Vulkan
           disable-animations: true
           script: |
             echo "[$(date -u +%T)] emulator is installed and fully booted"
