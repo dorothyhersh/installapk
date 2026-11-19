@@ -1,4 +1,4 @@
-name: FB 1 - Login and backup to Mega
+name: FB 1 - Login via phone internet and backup to Mega
 
 on:
   workflow_dispatch:
@@ -13,13 +13,50 @@ on:
         type: string
         default: "com.facebook.katana"
 
+env:
+  PHONE_IP: 100.85.72.32
+
 jobs:
   login:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Record baseline IP (runner's own IP, before the phone)
+        run: echo "BASELINE_IP=$(curl -s --max-time 20 https://ifconfig.me)" | tee -a $GITHUB_ENV
+
+      # Big downloads happen NOW, on the fast runner internet, so the slow phone link is
+      # only used for the Facebook part.
+      - name: Pre-download Facebook APK (runner internet, before the phone)
+        env:
+          APK_URL: ${{ inputs.apk_url }}
+          RCLONE_CONF_CONTENT: ${{ secrets.RCLONE_CONF }}
+        run: |
+          set -e
+          APK_OUT="$RUNNER_TEMP/fb.apk"
+          if [ -n "$APK_URL" ]; then
+            echo "Downloading APK from URL"
+            curl -L --fail --retry 3 --connect-timeout 20 -o "$APK_OUT" "$APK_URL"
+          else
+            echo "Downloading APK zip from Mega"
+            curl -fsSL -o /tmp/rclone.zip https://downloads.rclone.org/rclone-current-linux-amd64.zip
+            unzip -q /tmp/rclone.zip -d /tmp
+            sudo install -m 0755 /tmp/rclone-*-linux-amd64/rclone /usr/local/bin/rclone
+            mkdir -p ~/.config/rclone
+            printf '%s\n' "$RCLONE_CONF_CONTENT" > ~/.config/rclone/rclone.conf
+            chmod 600 ~/.config/rclone/rclone.conf
+            rclone copyto "mega:facebook-apk/facebook.zip" "$APK_OUT" --retries 5 -v
+          fi
+          ls -l "$APK_OUT"
 
       - name: Enable KVM
         run: |
@@ -27,9 +64,16 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
-      - name: Login and back up
+      # Emulator SDK/system image download + boot use the runner's normal internet.
+      # THEN the phone exit node is switched on (first script line), BEFORE Facebook is
+      # installed, launched or logged in. The login script also refuses to run or type
+      # credentials if the phone IP is not in use.
+      - name: Start emulator, then switch to phone IP, then login
         uses: reactivecircus/android-emulator-runner@v2
         env:
+          PHONE_IP: ${{ env.PHONE_IP }}
+          BASELINE_IP: ${{ env.BASELINE_IP }}
+          EXPECTED_PHONE_IP: ${{ secrets.EXPECTED_PHONE_IP }}
           MODE: login
           APK_URL: ${{ inputs.apk_url }}
           PACKAGE_NAME: ${{ inputs.package_name }}
@@ -52,7 +96,24 @@ jobs:
           emulator-boot-timeout: 600
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-metrics
           disable-animations: true
-          script: bash scripts/facebook-install-and-login.sh
+          script: |
+            echo "[$(date -u +%T)] EMULATOR IS BOOTED - SDK download and boot are finished"
+            adb devices -l
+            echo "[$(date -u +%T)] public IP BEFORE phone: $(curl -s --max-time 20 https://ifconfig.me)"
+            bash scripts/use-phone-exit-node.sh
+            echo "[$(date -u +%T)] public IP AFTER phone: $(curl -s --max-time 30 https://ifconfig.me)"
+            echo "[$(date -u +%T)] starting Facebook install and login script"
+            bash scripts/facebook-install-and-login.sh
+            echo "[$(date -u +%T)] Facebook script finished"
+
+      - name: Print all logs
+        if: always()
+        run: |
+          echo "=== tailscale status ==="; tailscale status || true
+          echo "=== public IP now ==="; curl -s --max-time 20 https://ifconfig.me || true; echo
+          echo "=== run.log (everything the Facebook script did) ==="; cat artifacts/run.log 2>/dev/null || echo "no run.log (script never started)"
+          echo "=== artifacts ==="; ls -la artifacts/ 2>/dev/null || echo "no artifacts folder"
+          echo "=== logcat (last 200 lines) ==="; tail -n 200 artifacts/logcat.txt 2>/dev/null || echo "no logcat"
 
       - name: Upload screenshots and logs
         uses: actions/upload-artifact@v4
