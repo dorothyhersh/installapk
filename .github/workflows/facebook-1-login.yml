@@ -97,23 +97,8 @@ jobs:
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-metrics
           disable-animations: true
           script: |
-            echo "[$(date -u +%T)] EMULATOR IS BOOTED - SDK download and boot are finished"
-            adb devices -l
-            echo "[$(date -u +%T)] public IP BEFORE phone: $(curl -s --max-time 20 https://ifconfig.me)"
             bash scripts/use-phone-exit-node.sh
-            echo "[$(date -u +%T)] public IP AFTER phone: $(curl -s --max-time 30 https://ifconfig.me)"
-            echo "[$(date -u +%T)] starting Facebook install and login script"
             bash scripts/facebook-install-and-login.sh
-            echo "[$(date -u +%T)] Facebook script finished"
-
-      - name: Print all logs
-        if: always()
-        run: |
-          echo "=== tailscale status ==="; tailscale status || true
-          echo "=== public IP now ==="; curl -s --max-time 20 https://ifconfig.me || true; echo
-          echo "=== run.log (everything the Facebook script did) ==="; cat artifacts/run.log 2>/dev/null || echo "no run.log (script never started)"
-          echo "=== artifacts ==="; ls -la artifacts/ 2>/dev/null || echo "no artifacts folder"
-          echo "=== logcat (last 200 lines) ==="; tail -n 200 artifacts/logcat.txt 2>/dev/null || echo "no logcat"
 
       - name: Upload screenshots and logs
         uses: actions/upload-artifact@v4
