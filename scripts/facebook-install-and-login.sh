@@ -115,16 +115,42 @@ settle_device() {
 # ---------------- Mega via rclone ----------------
 rclone_has_mega() { rclone help backends 2>/dev/null | grep -qiE '(^|[[:space:]])mega([[:space:]]|$)'; }
 
+# Downloads the official rclone build (the distro/apt one has no mega backend) with retries and a
+# pinned-version fallback, and logs WHY if it fails instead of failing silently.
+install_official_rclone() {
+  local tmp url attempt bin ok=1
+  local pinned="v1.68.2"
+  tmp="$(mktemp -d)"
+  for url in \
+    "https://downloads.rclone.org/rclone-current-linux-amd64.zip" \
+    "https://downloads.rclone.org/${pinned}/rclone-${pinned}-linux-amd64.zip" \
+    "https://github.com/rclone/rclone/releases/download/${pinned}/rclone-${pinned}-linux-amd64.zip"; do
+    for attempt in 1 2 3; do
+      rm -rf "$tmp"/*
+      if curl -fSL --retry 3 --connect-timeout 20 --max-time 180 -o "$tmp/rclone.zip" "$url" 2>"$tmp/curl.err" \
+         && unzip -q -o "$tmp/rclone.zip" -d "$tmp" 2>"$tmp/unzip.err"; then
+        bin="$(find "$tmp" -type f -name rclone | head -1)"
+        if [[ -n "$bin" ]] && sudo install -m 0755 "$bin" /usr/local/bin/rclone; then ok=0; break 2; fi
+      fi
+      log "rclone download/install failed ($url, attempt $attempt): $(cat "$tmp/curl.err" "$tmp/unzip.err" 2>/dev/null | tr '\n' ' ' | head -c 300)"
+      sleep 4
+    done
+  done
+  rm -rf "$tmp"
+  export PATH="/usr/local/bin:$PATH"; hash -r
+  return $ok
+}
+
 setup_rclone() {
+  export PATH="/usr/local/bin:$PATH"
   if ! command -v rclone >/dev/null 2>&1 || ! rclone_has_mega; then
     log "installing official rclone"
-    local tmp; tmp="$(mktemp -d)"
-    curl -fsSL -o "$tmp/rclone.zip" https://downloads.rclone.org/rclone-current-linux-amd64.zip \
-      && unzip -q "$tmp/rclone.zip" -d "$tmp" \
-      && sudo install -m 0755 "$tmp"/rclone-*-linux-amd64/rclone /usr/local/bin/rclone
-    rm -rf "$tmp"; hash -r
+    install_official_rclone || log "WARNING: could not download official rclone"
   fi
-  rclone_has_mega || { log "rclone has no mega backend"; return 1; }
+  if ! rclone_has_mega; then
+    log "rclone has no mega backend (rclone path: $(command -v rclone || echo none); $(rclone version 2>&1 | head -1))"
+    return 1
+  fi
   if [[ ! -s "$RCLONE_CFG" ]]; then
     [[ -n "$RCLONE_CONF_CONTENT" ]] || { log "RCLONE_CONF secret is empty"; return 1; }
     mkdir -p "$(dirname "$RCLONE_CFG")"
