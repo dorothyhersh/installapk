@@ -14,38 +14,44 @@ jobs:
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
 
-      - name: Baseline speed (normal GitHub runner, no phone)
+      - name: Baseline IP and speed (no phone)
         run: |
-          echo "Public IP: $(curl -s https://ifconfig.me)"
+          echo "BASELINE_IP=$(curl -s https://ifconfig.me)" | tee -a $GITHUB_ENV
           head -c 10000000 /dev/urandom > /tmp/up.bin
           DOWN=$(curl -s -o /dev/null --max-time 60 -w '%{speed_download}' "https://speed.cloudflare.com/__down?bytes=25000000")
-          UP=$(curl -s -o /dev/null --max-time 60 -w '%{speed_upload}' -X POST --data-binary @/tmp/up.bin "https://speed.cloudflare.com/__up")
           echo "Baseline download: $(echo $DOWN | awk '{printf "%.2f", $1*8/1000000}') Mbps"
-          echo "Baseline upload:   $(echo $UP | awk '{printf "%.2f", $1*8/1000000}') Mbps"
+
+      - name: Show available exit nodes
+        run: |
+          tailscale status
+          echo "---- exit nodes ----"
+          tailscale exit-node list || true
 
       - name: Route traffic through my phone
         run: |
           sudo tailscale set --exit-node=100.85.72.32 --exit-node-allow-lan-access=true
-          sleep 5
+          sleep 8
           tailscale status
-
-      - name: Check connection to phone (direct or relay)
-        run: |
           tailscale ping -c 4 100.85.72.32 || true
-          tailscale status | grep infinix || true
 
-      - name: Verify IP (should be your phone's mobile IP)
+      - name: Verify IP changed
         run: |
-          echo "Public IP now: $(curl -s --max-time 20 https://ifconfig.me)"
+          NEW_IP=$(curl -s --max-time 30 https://ifconfig.me)
+          echo "Baseline IP: $BASELINE_IP"
+          echo "Phone IP:    $NEW_IP"
+          curl -s --max-time 20 "https://ipinfo.io/$NEW_IP/org" || true
+          echo
+          if [ -z "$NEW_IP" ] || [ "$NEW_IP" = "$BASELINE_IP" ]; then
+            echo "ERROR: traffic is NOT going through the phone"
+            exit 1
+          fi
 
       - name: Speed test through my phone
         run: |
           DOWN=$(curl -s -o /dev/null --max-time 90 -w '%{speed_download}' "https://speed.cloudflare.com/__down?bytes=25000000")
           UP=$(curl -s -o /dev/null --max-time 90 -w '%{speed_upload}' -X POST --data-binary @/tmp/up.bin "https://speed.cloudflare.com/__up")
-          LAT=$(curl -s -o /dev/null --max-time 20 -w '%{time_starttransfer}' "https://speed.cloudflare.com/__down?bytes=0")
           echo "Phone download: $(echo $DOWN | awk '{printf "%.2f", $1*8/1000000}') Mbps"
           echo "Phone upload:   $(echo $UP | awk '{printf "%.2f", $1*8/1000000}') Mbps"
-          echo "Phone latency:  $(echo $LAT | awk '{printf "%.0f", $1*1000}') ms"
 
       - name: Your actual job
         run: |
