@@ -36,6 +36,7 @@ jobs:
           MODE: restore
           PACKAGE_NAME: ${{ inputs.package_name }}
           RESAVE: ${{ inputs.resave && '1' || '0' }}
+          APK_MEGA_FILE: facebook-apk/facebook.zip
           FB_PAGE_NAME: ${{ secrets.FB_PAGE_NAME }}
           BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
           RCLONE_CONF_CONTENT: ${{ secrets.RCLONE_CONF }}
