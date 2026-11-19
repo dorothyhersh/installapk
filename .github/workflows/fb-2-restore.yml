@@ -28,6 +28,11 @@ on:
         required: false
         type: string
         default: "FB_Reels2"
+      reencode_reels:
+        description: "Re-encode videos to emulator-friendly H.264/AAC before posting (1 = yes, 0 = no)"
+        required: false
+        type: string
+        default: "1"
 
 jobs:
   restore:
@@ -38,6 +43,37 @@ jobs:
         uses: actions/checkout@v4
 
       # No Tailscale step here on purpose: restore uses the plain GitHub runner IP.
+
+      # Installed BEFORE the emulator starts so a flaky download cannot waste the emulator boot.
+      - name: Install rclone (official build with Mega backend)
+        run: |
+          ok=0
+          for url in \
+            "https://downloads.rclone.org/rclone-current-linux-amd64.zip" \
+            "https://downloads.rclone.org/v1.68.2/rclone-v1.68.2-linux-amd64.zip" \
+            "https://github.com/rclone/rclone/releases/download/v1.68.2/rclone-v1.68.2-linux-amd64.zip"; do
+            for i in 1 2 3; do
+              rm -rf /tmp/rclone-dl && mkdir -p /tmp/rclone-dl
+              if curl -fSL --retry 3 --connect-timeout 20 --max-time 180 -o /tmp/rclone-dl/rclone.zip "$url" \
+                 && unzip -q -o /tmp/rclone-dl/rclone.zip -d /tmp/rclone-dl; then
+                ok=1; break 2
+              fi
+              echo "rclone download failed ($url, attempt $i)"; sleep 4
+            done
+          done
+          [ "$ok" = "1" ] || { echo "ERROR: could not download rclone"; exit 1; }
+          sudo install -m 0755 "$(find /tmp/rclone-dl -type f -name rclone | head -1)" /usr/local/bin/rclone
+          rclone version | head -1
+          rclone help backends | grep -i mega
+
+      # Used to re-encode reel videos so the emulator's software decoder can play them.
+      - name: Install ffmpeg
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ffmpeg
+          fi
+          ffmpeg -version | head -1
 
       - name: Enable KVM
         run: |
@@ -60,6 +96,8 @@ jobs:
           REEL_COUNT: ${{ inputs.reel_count }}
           MEGA_REELS_SRC: ${{ inputs.reels_src_folder }}
           MEGA_REELS_DONE: ${{ inputs.reels_done_folder }}
+          REENCODE_REELS: ${{ inputs.reencode_reels }}
+          MAX_PLAYBACK_FAILS: "2"
         with:
           api-level: 30
           target: google_apis
@@ -69,7 +107,7 @@ jobs:
           ram-size: 3072M
           force-avd-creation: true
           emulator-boot-timeout: 600
-          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-metrics -feature -Vulkan
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-metrics
           disable-animations: true
           script: |
             echo "[$(date -u +%T)] emulator is installed and fully booted"
