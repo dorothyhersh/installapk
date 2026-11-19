@@ -476,6 +476,24 @@ restore_session() {
 
 # ---------------- Reel posting ----------------
 
+# log_restored_profile() and switch_to_page() both leave the app sitting on the Menu screen
+# (they open it to read the profile name). The reel composer is opened from the feed, so make
+# sure Menu is closed and the feed is back on screen before touching the + icon.
+return_to_feed() {
+  local i
+  for i in 1 2 3; do
+    ui_dump || true
+    if grep -qiE 'Your shortcuts|Settings and privacy' "$UI_XML" 2>/dev/null; then
+      log "closing Menu to get back to the feed (attempt $i)"
+      adb shell input keyevent 4 >/dev/null 2>&1
+      sleep 3
+    else
+      break
+    fi
+  done
+  dismiss_system_dialogs
+}
+
 # ADBKeyboard types unicode (emoji, hashtags, accents) reliably; the stock `input text` cannot.
 setup_adb_keyboard() {
   if adb shell pm list packages 2>/dev/null | grep -q "$ADBKEYBOARD_PKG"; then
@@ -588,59 +606,60 @@ PY
 compose_one_reel() {
   local idx="$1" caption="$2" xy ok=0 i
 
+  # feed -> tap + -> "Post / Story / Reel / Live" menu
   tap_text '^(Create|Add)$' "780 119" 4 || { log "ERROR: create (+) button not found"; return 2; }
   sleep 4
   screenshot "r${idx}-00-create-menu.png"; save_ui "r${idx}-create-menu"
   log "texts in create menu:"; ui_texts | head -30 | sed 's/^/[fb]   /'
 
-  xy="$(ui_find text '^Reels?$' 0 || true)"
+  xy="$(ui_find text '^Reel$' 0 || true)"
   [[ -z "$xy" ]] && xy="$(ui_find text 'Reel' 0 || true)"
   [[ -n "$xy" ]] || { log "ERROR: 'Reel' option not found in the create menu"; return 2; }
   log "tap Reel option at $xy"; adb shell input tap $xy; sleep 6
-  screenshot "r${idx}-01-reel-composer.png"; save_ui "r${idx}-reel-composer"
-  log "texts in reel composer:"; ui_texts | head -30 | sed 's/^/[fb]   /'
 
-  xy="$(ui_find text '(Select from Gallery|Upload|Choose from Library|Add from Gallery|^Gallery$)' 0 || true)"
-  if [[ -n "$xy" ]]; then
-    log "tap gallery/upload entry at $xy"; adb shell input tap $xy; sleep 5
-  else
-    log "no explicit gallery button found, assuming the picker opened directly"
-  fi
-  screenshot "r${idx}-02-picker.png"; save_ui "r${idx}-picker"
+  # "Create reel" screen: a Gallery grid is shown directly, no extra button to open it
+  screenshot "r${idx}-01-create-reel-gallery.png"; save_ui "r${idx}-create-reel-gallery"
+  log "texts in Create reel / gallery:"; ui_texts | head -30 | sed 's/^/[fb]   /'
 
   xy="$(pick_single_video_thumb || true)"
-  [[ -n "$xy" ]] || { log "ERROR: video thumbnail not found in the picker (see r${idx}-02-picker.png)"; return 1; }
-  log "tap video thumbnail at $xy"; adb shell input tap $xy; sleep 5
-  screenshot "r${idx}-03-selected.png"; save_ui "r${idx}-selected"
+  [[ -n "$xy" ]] || { log "ERROR: video thumbnail not found in the gallery grid (see r${idx}-01-create-reel-gallery.png)"; return 1; }
+  log "tap video thumbnail at $xy"; adb shell input tap $xy; sleep 6
 
-  # Some picker layouts need an explicit Done/Next to leave the grid
-  tap_text '^(Done|Next)$' "" 2 >/dev/null 2>&1 || true
-  sleep 3
+  # Picking the video opens the "Edit reel" screen (Audio/Text/Effects/Stickers/Save, -> Next)
+  screenshot "r${idx}-02-edit-reel.png"; save_ui "r${idx}-edit-reel"
+  log "texts in Edit reel:"; ui_texts | head -30 | sed 's/^/[fb]   /'
 
-  # Step through up to 3 editor screens, each closed with a "Next" button
-  for i in 1 2 3; do
+  xy="$(ui_find text '^Next$' 0 || true)"
+  [[ -n "$xy" ]] || { log "ERROR: Next button not found on the Edit reel screen"; return 1; }
+  log "tap Next at $xy"; adb shell input tap $xy; sleep 5
+
+  # If there's a second "Next" screen before Reel Settings, step through it too (usually none)
+  for i in 1 2; do
     ui_dump || true
+    grep -qi 'Describe your reel' "$UI_XML" && break
     xy="$(ui_query text '^Next$' 0 || true)"
     [[ -z "$xy" ]] && break
-    log "tap Next ($i) at $xy"; adb shell input tap $xy; sleep 4
+    log "tap Next ($((i+1))) at $xy"; adb shell input tap $xy; sleep 4
   done
-  screenshot "r${idx}-04-before-caption.png"; save_ui "r${idx}-before-caption"
-  log "texts before caption step:"; ui_texts | head -30 | sed 's/^/[fb]   /'
+
+  # "Reel Settings" screen: caption placeholder "Describe your reel. You can also add
+  # hashtags here." and the "Share now" button
+  screenshot "r${idx}-03-reel-settings.png"; save_ui "r${idx}-reel-settings"
+  log "texts in Reel Settings:"; ui_texts | head -30 | sed 's/^/[fb]   /'
 
   xy="$(ui_find text 'Describe your reel' 0 || true)"
-  [[ -z "$xy" ]] && xy="$(ui_find text '(Write a caption|Say something about this reel)' 0 || true)"
-  [[ -n "$xy" ]] || { log "ERROR: caption field not found"; return 1; }
+  [[ -n "$xy" ]] || { log "ERROR: caption field not found on Reel Settings"; return 1; }
   log "tap caption field at $xy"; adb shell input tap $xy; sleep 2
 
   setup_adb_keyboard || { log "ERROR: ADBKeyboard not ready, cannot type caption"; return 1; }
   adb_type_unicode "$caption"
-  screenshot "r${idx}-05-caption-typed.png"; save_ui "r${idx}-caption-typed"
+  screenshot "r${idx}-04-caption-typed.png"; save_ui "r${idx}-caption-typed"
 
-  adb shell input keyevent 4 >/dev/null 2>&1; sleep 1   # hide keyboard so Share is visible
+  adb shell input keyevent 4 >/dev/null 2>&1; sleep 1   # hide keyboard so Share now is visible
 
-  xy="$(ui_find text '^Share( ?now)?$' 0 || true)"
-  [[ -n "$xy" ]] || { log "ERROR: Share button not found"; return 1; }
-  log "tap Share at $xy"; adb shell input tap $xy
+  xy="$(ui_find text '^Share now$' 0 || true)"
+  [[ -n "$xy" ]] || { log "ERROR: Share now button not found"; return 1; }
+  log "tap Share now at $xy"; adb shell input tap $xy
 
   # Upload+share can take a while; poll until the composer closes
   for i in $(seq 1 24); do
@@ -650,9 +669,9 @@ compose_one_reel() {
       ok=1; break
     fi
   done
-  screenshot "r${idx}-06-after-share.png"; save_ui "r${idx}-after-share"
+  screenshot "r${idx}-05-after-share.png"; save_ui "r${idx}-after-share"
   if [[ "$ok" == "1" ]]; then log "reel #${idx} SHARED"; return 0; fi
-  log "ERROR: could not confirm reel #${idx} finished sharing (see r${idx}-06-after-share.png)"
+  log "ERROR: could not confirm reel #${idx} finished sharing (see r${idx}-05-after-share.png)"
   return 1
 }
 
@@ -771,6 +790,7 @@ login_flow() {
     # backup (local) -> switch to runner IP -> fast Mega upload. The app is NOT relaunched afterwards,
     # so Facebook never sees the runner IP right after the phone IP login.
     [[ "$MAKE_BACKUP" == "1" ]] && { backup_and_upload || log "WARNING: backup not created"; }
+    return_to_feed
     post_reels_flow
   else
     log "WARNING: feed not detected, NOT creating a backup (a good old backup is never replaced by a bad one)"
@@ -808,6 +828,7 @@ restore_flow() {
     log "RESTORE OK: Facebook opened already logged in"
     log_restored_profile
     [[ "$RESAVE" == "1" ]] && { backup_and_upload || log "WARNING: refreshed backup not created"; }
+    return_to_feed
     post_reels_flow
     return 0
   fi
