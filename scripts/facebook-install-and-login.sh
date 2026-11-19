@@ -7,6 +7,13 @@
 #      BACKUP_PASSPHRASE, RCLONE_CONF_CONTENT, MEGA_FOLDER, MEGA_FILE, MAKE_BACKUP, RESAVE
 # Phone exit node (LOGIN mode only): PHONE_IP, BASELINE_IP, EXPECTED_PHONE_IP (optional) are used
 # by the IP guard. RESTORE mode ignores all of these and just uses whatever IP the runner has.
+#
+# Reel posting (runs after a successful login or restore, on the Page): set REEL_COUNT to the
+# number of reels to post (default 0 = skip). Downloads that many videos from
+# mega:<MEGA_REELS_SRC> (default FB_Reels), posts each one with the caption in CAPTION_FILE
+# (default scripts/caption.txt), then moves the posted video to mega:<MEGA_REELS_DONE> (default
+# FB_Reels2) so it is never posted twice. Uses the ADBKeyboard IME (installed automatically) so
+# the caption's emoji/hashtags/unicode type correctly.
 set -uo pipefail
 
 ROOT="${GITHUB_WORKSPACE:-$(pwd)}"
@@ -32,6 +39,16 @@ MEGA_FOLDER="${MEGA_FOLDER:-facebook-android-backup}"
 MEGA_FILE="${MEGA_FILE:-fb-session.tgz.enc}"
 MEGA_KEEP="${MEGA_KEEP:-10}"
 MEGA_DIR="${MEGA_REMOTE}:${MEGA_FOLDER}"
+
+# Reel posting
+REEL_COUNT="${REEL_COUNT:-0}"
+MEGA_REELS_SRC="${MEGA_REELS_SRC:-FB_Reels}"
+MEGA_REELS_DONE="${MEGA_REELS_DONE:-FB_Reels2}"
+CAPTION_FILE="${CAPTION_FILE:-${ROOT}/scripts/caption.txt}"
+REELS_LOCAL_DIR="${RUNNER_TEMP:-/tmp}/reels"
+ADBKEYBOARD_APK_URL="${ADBKEYBOARD_APK_URL:-https://github.com/senzhk/ADBKeyBoard/raw/master/ADBKeyboard.apk}"
+ADBKEYBOARD_PKG="com.android.adbkeyboard"
+ADBKEYBOARD_APK="${RUNNER_TEMP:-/tmp}/ADBKeyboard.apk"
 
 APK_FILE="${RUNNER_TEMP:-/tmp}/fb.apk"
 UI_XML="${RUNNER_TEMP:-/tmp}/ui.xml"
@@ -457,6 +474,239 @@ restore_session() {
   log "session data restored"
 }
 
+# ---------------- Reel posting ----------------
+
+# ADBKeyboard types unicode (emoji, hashtags, accents) reliably; the stock `input text` cannot.
+setup_adb_keyboard() {
+  if adb shell pm list packages 2>/dev/null | grep -q "$ADBKEYBOARD_PKG"; then
+    log "ADBKeyboard already installed"
+  else
+    log "installing ADBKeyboard (for typing unicode/emoji captions)"
+    curl -fsSL --retry 3 -o "$ADBKEYBOARD_APK" "$ADBKEYBOARD_APK_URL" || { log "ERROR: could not download ADBKeyboard"; return 1; }
+    adb install -r -g "$ADBKEYBOARD_APK" || { log "ERROR: could not install ADBKeyboard"; return 1; }
+  fi
+  adb shell ime enable ${ADBKEYBOARD_PKG}/.AdbIME >/dev/null 2>&1
+  adb shell ime set ${ADBKEYBOARD_PKG}/.AdbIME >/dev/null 2>&1
+  sleep 1
+  local cur; cur="$(adb shell settings get secure default_input_method 2>/dev/null | tr -d '\r')"
+  if [[ "$cur" != *"$ADBKEYBOARD_PKG"* ]]; then
+    log "ERROR: ADBKeyboard could not be set as the default IME (current: '$cur')"
+    return 1
+  fi
+}
+
+# Clears the focused field, then types $1 (any UTF-8: emoji, hashtags, accents) via ADBKeyboard
+adb_type_unicode() {
+  local text="$1" b64
+  adb shell am broadcast -a ADB_CLEAR_TEXT >/dev/null 2>&1
+  sleep 1
+  b64="$(printf '%s' "$text" | base64 -w0)"
+  adb shell am broadcast -a ADB_INPUT_B64 --es msg "$b64" >/dev/null 2>&1
+  sleep 2
+}
+
+read_caption() {
+  [[ -s "$CAPTION_FILE" ]] || { log "ERROR: caption file not found or empty: $CAPTION_FILE"; return 1; }
+  cat "$CAPTION_FILE"
+}
+
+# Video files in mega:<MEGA_REELS_SRC> not yet moved to mega:<MEGA_REELS_DONE>, oldest name first
+list_pending_reels() {
+  rclone lsf "${MEGA_REMOTE}:${MEGA_REELS_SRC}" \
+    --include '*.mp4' --include '*.MP4' --include '*.mov' --include '*.MOV' --include '*.m4v' --include '*.M4V' \
+    2>/dev/null | sort
+}
+
+download_reel() {
+  local name="$1" dest="${REELS_LOCAL_DIR}/${name}"
+  mkdir -p "$REELS_LOCAL_DIR"
+  rclone copyto "${MEGA_REMOTE}:${MEGA_REELS_SRC}/${name}" "$dest" --retries 5 -q || return 1
+  [[ -s "$dest" ]] || return 1
+  echo "$dest"
+}
+
+# Pushes the video to the device and triggers a media scan so the gallery picker can see it.
+# Each reel is pushed, posted and deleted before the next one, so at most one video ever sits
+# on the device at a time - the picker never has to tell two videos apart.
+push_reel_to_device() {
+  local local_path="$1" name remote_path
+  name="$(basename "$local_path")"
+  remote_path="/sdcard/Movies/${name}"
+  adb push "$local_path" "$remote_path" >/dev/null 2>&1 || return 1
+  adb shell am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d "file://${remote_path}" >/dev/null 2>&1
+  sleep 3
+  echo "$remote_path"
+}
+
+remove_reel_from_device() {
+  local remote_path="$1"
+  [[ -n "$remote_path" ]] || return 0
+  adb shell rm -f "$remote_path" >/dev/null 2>&1
+  adb shell am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d "file://${remote_path}" >/dev/null 2>&1
+}
+
+# In the media picker, finds the one video thumbnail: first by its duration badge (e.g. "0:12"),
+# falling back to the first sizeable clickable grid cell below the header.
+pick_single_video_thumb() {
+  python3 - "$UI_XML" <<'PY'
+import re, sys, xml.etree.ElementTree as ET
+root = ET.parse(sys.argv[1]).getroot()
+dur = re.compile(r'^\d{1,2}:\d{2}$')
+hits = []
+for n in root.iter('node'):
+    a = n.attrib
+    t = (a.get('text') or '').strip()
+    m = re.findall(r'\d+', a.get('bounds', ''))
+    if dur.match(t) and len(m) == 4:
+        x1, y1, x2, y2 = map(int, m)
+        hits.append(((x1 + x2) // 2, (y1 + y2) // 2))
+if hits:
+    print(hits[0][0], hits[0][1])
+    sys.exit(0)
+best = None
+for n in root.iter('node'):
+    a = n.attrib
+    if a.get('clickable') != 'true':
+        continue
+    m = re.findall(r'\d+', a.get('bounds', ''))
+    if len(m) != 4:
+        continue
+    x1, y1, x2, y2 = map(int, m)
+    w, h = x2 - x1, y2 - y1
+    if w < 150 or h < 150 or y1 < 350:
+        continue
+    if best is None or (y1, x1) < (best[0], best[1]):
+        best = (y1, x1, (x1 + x2) // 2, (y1 + y2) // 2)
+if best:
+    print(best[2], best[3])
+PY
+}
+
+# Full composer flow for one reel: + -> Reel -> pick video -> Next* -> caption -> Share.
+# Return codes: 0 = shared OK, 1 = this video failed (retryable, left in MEGA_REELS_SRC),
+# 2 = a structural step failed (same for every video, so the caller stops the whole loop).
+compose_one_reel() {
+  local idx="$1" caption="$2" xy ok=0 i
+
+  tap_text '^(Create|Add)$' "780 119" 4 || { log "ERROR: create (+) button not found"; return 2; }
+  sleep 4
+  screenshot "r${idx}-00-create-menu.png"; save_ui "r${idx}-create-menu"
+  log "texts in create menu:"; ui_texts | head -30 | sed 's/^/[fb]   /'
+
+  xy="$(ui_find text '^Reels?$' 0 || true)"
+  [[ -z "$xy" ]] && xy="$(ui_find text 'Reel' 0 || true)"
+  [[ -n "$xy" ]] || { log "ERROR: 'Reel' option not found in the create menu"; return 2; }
+  log "tap Reel option at $xy"; adb shell input tap $xy; sleep 6
+  screenshot "r${idx}-01-reel-composer.png"; save_ui "r${idx}-reel-composer"
+  log "texts in reel composer:"; ui_texts | head -30 | sed 's/^/[fb]   /'
+
+  xy="$(ui_find text '(Select from Gallery|Upload|Choose from Library|Add from Gallery|^Gallery$)' 0 || true)"
+  if [[ -n "$xy" ]]; then
+    log "tap gallery/upload entry at $xy"; adb shell input tap $xy; sleep 5
+  else
+    log "no explicit gallery button found, assuming the picker opened directly"
+  fi
+  screenshot "r${idx}-02-picker.png"; save_ui "r${idx}-picker"
+
+  xy="$(pick_single_video_thumb || true)"
+  [[ -n "$xy" ]] || { log "ERROR: video thumbnail not found in the picker (see r${idx}-02-picker.png)"; return 1; }
+  log "tap video thumbnail at $xy"; adb shell input tap $xy; sleep 5
+  screenshot "r${idx}-03-selected.png"; save_ui "r${idx}-selected"
+
+  # Some picker layouts need an explicit Done/Next to leave the grid
+  tap_text '^(Done|Next)$' "" 2 >/dev/null 2>&1 || true
+  sleep 3
+
+  # Step through up to 3 editor screens, each closed with a "Next" button
+  for i in 1 2 3; do
+    ui_dump || true
+    xy="$(ui_query text '^Next$' 0 || true)"
+    [[ -z "$xy" ]] && break
+    log "tap Next ($i) at $xy"; adb shell input tap $xy; sleep 4
+  done
+  screenshot "r${idx}-04-before-caption.png"; save_ui "r${idx}-before-caption"
+  log "texts before caption step:"; ui_texts | head -30 | sed 's/^/[fb]   /'
+
+  xy="$(ui_find text 'Describe your reel' 0 || true)"
+  [[ -z "$xy" ]] && xy="$(ui_find text '(Write a caption|Say something about this reel)' 0 || true)"
+  [[ -n "$xy" ]] || { log "ERROR: caption field not found"; return 1; }
+  log "tap caption field at $xy"; adb shell input tap $xy; sleep 2
+
+  setup_adb_keyboard || { log "ERROR: ADBKeyboard not ready, cannot type caption"; return 1; }
+  adb_type_unicode "$caption"
+  screenshot "r${idx}-05-caption-typed.png"; save_ui "r${idx}-caption-typed"
+
+  adb shell input keyevent 4 >/dev/null 2>&1; sleep 1   # hide keyboard so Share is visible
+
+  xy="$(ui_find text '^Share( ?now)?$' 0 || true)"
+  [[ -n "$xy" ]] || { log "ERROR: Share button not found"; return 1; }
+  log "tap Share at $xy"; adb shell input tap $xy
+
+  # Upload+share can take a while; poll until the composer closes
+  for i in $(seq 1 24); do
+    sleep 5
+    ui_dump || continue
+    if ! grep -qiE 'describe your reel|share now' "$UI_XML" && grep -qiE 'Home|Menu|Notifications' "$UI_XML"; then
+      ok=1; break
+    fi
+  done
+  screenshot "r${idx}-06-after-share.png"; save_ui "r${idx}-after-share"
+  if [[ "$ok" == "1" ]]; then log "reel #${idx} SHARED"; return 0; fi
+  log "ERROR: could not confirm reel #${idx} finished sharing (see r${idx}-06-after-share.png)"
+  return 1
+}
+
+# Downloads up to REEL_COUNT pending videos from Mega and posts each one in turn. A video is
+# moved to MEGA_REELS_DONE only after its share is confirmed, so a run that fails partway never
+# reposts anything that already went out, and never loses a video that failed to post.
+post_reels_flow() {
+  local count="$REEL_COUNT"
+  [[ "$count" =~ ^[0-9]+$ ]] || count=0
+  (( count > 0 )) || { log "REEL_COUNT is 0, skipping reel posting"; return 0; }
+
+  setup_rclone || { log "ERROR: rclone/Mega not ready, cannot fetch reels"; return 1; }
+  local caption; caption="$(read_caption)" || return 1
+  log "caption loaded from $CAPTION_FILE ($(printf '%s' "$caption" | wc -c) bytes)"
+
+  mapfile -t pending < <(list_pending_reels)
+  if (( ${#pending[@]} == 0 )); then
+    log "no videos found in ${MEGA_REELS_SRC}"; return 0
+  fi
+  log "found ${#pending[@]} video(s) in ${MEGA_REELS_SRC}, will post up to $count"
+
+  local posted=0 idx=0 name local_path remote_path rc
+  for name in "${pending[@]}"; do
+    (( posted >= count )) && break
+    idx=$((idx+1))
+    log "=== reel $((posted+1))/$count: $name ==="
+
+    local_path="$(download_reel "$name" || true)"
+    [[ -n "$local_path" ]] || { log "ERROR: could not download $name from Mega, skipping"; continue; }
+
+    remote_path="$(push_reel_to_device "$local_path" || true)"
+    rm -f "$local_path"
+    [[ -n "$remote_path" ]] || { log "ERROR: could not push $name to the device, skipping"; continue; }
+
+    compose_one_reel "$idx" "$caption"; rc=$?
+    remove_reel_from_device "$remote_path"
+
+    if [[ "$rc" == "0" ]]; then
+      if rclone moveto "${MEGA_REMOTE}:${MEGA_REELS_SRC}/${name}" "${MEGA_REMOTE}:${MEGA_REELS_DONE}/${name}" --retries 5 -q; then
+        log "moved $name to ${MEGA_REELS_DONE} (will not be reposted)"
+      else
+        log "WARNING: reel posted but could not move $name in Mega - move it manually or it may be reposted"
+      fi
+      posted=$((posted+1))
+    elif [[ "$rc" == "2" ]]; then
+      log "structural failure, stopping reel posting (see r${idx}-* artifacts)"
+      break
+    else
+      log "reel $name failed, left in ${MEGA_REELS_SRC} for retry"
+    fi
+  done
+  log "reel posting done: $posted/${count} posted"
+}
+
 # ---------------- Facebook login ----------------
 login_flow() {
   if [[ -z "$FB_IDENTIFIER" || -z "$FB_PASSWORD" ]]; then
@@ -521,6 +771,7 @@ login_flow() {
     # backup (local) -> switch to runner IP -> fast Mega upload. The app is NOT relaunched afterwards,
     # so Facebook never sees the runner IP right after the phone IP login.
     [[ "$MAKE_BACKUP" == "1" ]] && { backup_and_upload || log "WARNING: backup not created"; }
+    post_reels_flow
   else
     log "WARNING: feed not detected, NOT creating a backup (a good old backup is never replaced by a bad one)"
     return 1
@@ -557,6 +808,7 @@ restore_flow() {
     log "RESTORE OK: Facebook opened already logged in"
     log_restored_profile
     [[ "$RESAVE" == "1" ]] && { backup_and_upload || log "WARNING: refreshed backup not created"; }
+    post_reels_flow
     return 0
   fi
   log "RESTORE FAILED: not logged in (see screenshots 10 and 11)"
