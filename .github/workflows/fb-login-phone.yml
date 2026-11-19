@@ -19,7 +19,7 @@ env:
 jobs:
   login:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -34,6 +34,16 @@ jobs:
       - name: Record baseline IP (runner's own IP, before the phone)
         run: echo "BASELINE_IP=$(curl -s --max-time 20 https://ifconfig.me)" | tee -a $GITHUB_ENV
 
+      # Download the zip BEFORE the emulator starts, on the runner internet (same IP as before the
+      # phone). Doing it while the emulator boots can starve the runner of CPU and kill the job.
+      - name: Download Facebook zip (runner internet, before emulator)
+        env:
+          BASELINE_IP: ${{ env.BASELINE_IP }}
+          APK_URL: ${{ inputs.apk_url }}
+          APK_MEGA_FILE: facebook-apk/facebook.zip
+          RCLONE_CONF_CONTENT: ${{ secrets.RCLONE_CONF }}
+        run: timeout 1000 bash scripts/download-apk.sh
+
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -42,7 +52,7 @@ jobs:
 
       # ORDER INSIDE THIS STEP:
       #  1) action installs SDK + boots emulator          -> runner internet (fast)
-      #  2) download-apk.sh downloads the Facebook zip    -> runner internet (fast)
+      #  2) (zip was already downloaded by the step before the emulator, runner internet)
       #  3) use-phone-exit-node.sh switches to the phone  -> from here on Telenor exit node IP
       #  4) facebook-install-and-login.sh installs the APK, launches Facebook and logs in
       #     -> all on the Telenor exit node IP (it also refuses to type credentials otherwise)
@@ -68,8 +78,8 @@ jobs:
           target: google_apis
           arch: x86_64
           profile: pixel_6
-          cores: 4
-          ram-size: 4096M
+          cores: 2
+          ram-size: 3072M
           force-avd-creation: true
           emulator-boot-timeout: 600
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-metrics
@@ -77,8 +87,8 @@ jobs:
           script: |
             echo "[$(date -u +%T)] STEP 1 DONE: emulator is installed and fully booted"
             adb devices -l
-            echo "[$(date -u +%T)] STEP 2: downloading the zip on the runner internet"
-            timeout 1000 bash scripts/download-apk.sh
+            echo "[$(date -u +%T)] STEP 2: zip was downloaded earlier on the runner internet:"
+            ls -l "$RUNNER_TEMP/fb.apk"
             echo "[$(date -u +%T)] STEP 3: switching to the phone (Telenor) exit node"
             timeout 300 bash scripts/use-phone-exit-node.sh
             echo "[$(date -u +%T)] public IP now: $(curl -s --max-time 30 https://ifconfig.me)"
