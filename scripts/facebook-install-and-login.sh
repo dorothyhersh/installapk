@@ -374,7 +374,9 @@ phone_guard || exit 1
 
 adb devices -l
 APK_MEGA_FILE="${APK_MEGA_FILE:-}"
-if [[ -n "$APK_URL" ]]; then
+if [[ -s "$APK_FILE" ]]; then
+  log "using APK already downloaded by the workflow: $APK_FILE ($(stat -c%s "$APK_FILE") bytes)"
+elif [[ -n "$APK_URL" ]]; then
   log "downloading APK from URL"
   curl -L --fail --retry 3 --connect-timeout 20 -o "$APK_FILE" "$APK_URL" || { log "ERROR: download failed"; exit 1; }
 elif [[ -n "$APK_MEGA_FILE" ]]; then
