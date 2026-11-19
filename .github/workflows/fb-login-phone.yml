@@ -1,0 +1,86 @@
+name: FB 1 - Login via phone internet and backup to Mega
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: "Direct URL to the APK/zip (leave empty to use the zip in Mega)"
+        required: false
+        type: string
+      package_name:
+        description: "Package name"
+        required: false
+        type: string
+        default: "com.facebook.katana"
+
+env:
+  PHONE_IP: 100.85.72.32
+
+jobs:
+  login:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Record baseline IP (runner's own IP, no phone)
+        run: echo "BASELINE_IP=$(curl -s --max-time 20 https://ifconfig.me)" | tee -a $GITHUB_ENV
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      # Phone exit node is switched on inside this step, after the emulator boots, so the big
+      # Android SDK / system image download uses the runner's normal internet. Everything the
+      # Facebook script does (APK from Mega, login, backup upload) goes through the phone, and
+      # the script refuses to run or type credentials if the phone IP is not in use.
+      - name: Login (via phone) and back up
+        uses: reactivecircus/android-emulator-runner@v2
+        env:
+          PHONE_IP: ${{ env.PHONE_IP }}
+          BASELINE_IP: ${{ env.BASELINE_IP }}
+          EXPECTED_PHONE_IP: ${{ secrets.EXPECTED_PHONE_IP }}
+          MODE: login
+          APK_URL: ${{ inputs.apk_url }}
+          PACKAGE_NAME: ${{ inputs.package_name }}
+          APK_MEGA_FILE: facebook-apk/facebook.zip
+          MAKE_BACKUP: "1"
+          FB_IDENTIFIER: ${{ secrets.FB_IDENTIFIER }}
+          FB_PASSWORD: ${{ secrets.FB_PASSWORD }}
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+          RCLONE_CONF_CONTENT: ${{ secrets.RCLONE_CONF }}
+          MEGA_FOLDER: facebook-android-backup
+          MEGA_FILE: fb-session.tgz.enc
+        with:
+          api-level: 30
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 4
+          ram-size: 4096M
+          force-avd-creation: true
+          emulator-boot-timeout: 600
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-metrics
+          disable-animations: true
+          script: |
+            bash scripts/use-phone-exit-node.sh
+            bash scripts/facebook-install-and-login.sh
+
+      - name: Upload screenshots and logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fb-login-screenshots
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 3
