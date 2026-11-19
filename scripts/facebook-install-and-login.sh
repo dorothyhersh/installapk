@@ -14,6 +14,14 @@
 # (default scripts/caption.txt), then moves the posted video to mega:<MEGA_REELS_DONE> (default
 # FB_Reels2) so it is never posted twice. Uses the ADBKeyboard IME (installed automatically) so
 # the caption's emoji/hashtags/unicode type correctly.
+#
+# REENCODE_REELS=1 (default): each video is re-encoded on the runner to plain Main-profile
+# H.264 / AAC, 30 fps, yuv420p, max 720 px wide BEFORE it is pushed to the emulator. The
+# emulator's software decoder cannot play many phone clips as-is (HEVC, variable frame rate,
+# high profiles) and Facebook then shows "Couldn't play video". Set REENCODE_REELS=0 to skip.
+#
+# MAX_PLAYBACK_FAILS (default 2): stop the reel loop after this many consecutive
+# "Couldn't play video" errors (that is an emulator problem, not a one-off bad file).
 set -uo pipefail
 
 ROOT="${GITHUB_WORKSPACE:-$(pwd)}"
@@ -46,6 +54,8 @@ MEGA_REELS_SRC="${MEGA_REELS_SRC:-FB_Reels}"
 MEGA_REELS_DONE="${MEGA_REELS_DONE:-FB_Reels2}"
 CAPTION_FILE="${CAPTION_FILE:-${ROOT}/scripts/caption.txt}"
 REELS_LOCAL_DIR="${RUNNER_TEMP:-/tmp}/reels"
+REENCODE_REELS="${REENCODE_REELS:-1}"
+MAX_PLAYBACK_FAILS="${MAX_PLAYBACK_FAILS:-2}"
 ADBKEYBOARD_APK_URL="${ADBKEYBOARD_APK_URL:-https://github.com/senzhk/ADBKeyBoard/raw/master/ADBKeyboard.apk}"
 ADBKEYBOARD_PKG="com.android.adbkeyboard"
 ADBKEYBOARD_APK="${RUNNER_TEMP:-/tmp}/ADBKeyboard.apk"
@@ -494,6 +504,45 @@ return_to_feed() {
   dismiss_system_dialogs
 }
 
+# After a failed (or finished) reel attempt the app can be stuck on the "Couldn't play video"
+# dialog, the Edit reel screen, the gallery, or a "Discard?" prompt. Get back to the plain feed
+# so the next reel starts from a known state. Last resort: force-stop and relaunch (the logged-in
+# session is on disk, so no new login is needed).
+# Feed check: the feed has "What's on your mind?"; composer screens have "Add audio",
+# "Select multiple", "Camera roll settings" or "Describe your reel". (Do NOT test for
+# "Create reel": the feed's own story strip has a "Create reel" tile.)
+recover_to_feed() {
+  local i xy
+  for i in 1 2 3 4 5; do
+    ui_dump || true
+    # playback error dialog -> OK
+    if grep -qiE "Couldn.t play video" "$UI_XML"; then
+      xy="$(ui_query text '^OK$' 0 || true)"
+      [[ -n "$xy" ]] && { log "recover: dismissing 'Couldn't play video' dialog"; adb shell input tap $xy; sleep 2; }
+      ui_dump || true
+    fi
+    # already on the feed?
+    if grep -qiE "What.s on your mind" "$UI_XML" \
+       && ! grep -qiE 'Add audio|Select multiple|Camera roll settings|Describe your reel|Share now' "$UI_XML"; then
+      return 0
+    fi
+    # "Discard / Leave" style confirmation -> confirm, otherwise press Back
+    xy="$(ui_query text '^(Discard|Discard reel|Discard edits|Delete|Leave|Exit|Leave and discard)$' 0 || true)"
+    if [[ -n "$xy" ]]; then
+      log "recover: confirming discard at $xy"; adb shell input tap $xy
+    else
+      adb shell input keyevent 4 >/dev/null 2>&1
+    fi
+    sleep 3
+  done
+  log "recover_to_feed: still not on the feed, force-stop + relaunch (session is on disk)"
+  adb shell am force-stop "$PACKAGE_NAME"; sleep 2
+  launch_app; sleep 20
+  dismiss_system_dialogs
+  dismiss_popups 3
+  return 0
+}
+
 # ADBKeyboard types unicode (emoji, hashtags, accents) reliably; the stock `input text` cannot.
 setup_adb_keyboard() {
   if adb shell pm list packages 2>/dev/null | grep -q "$ADBKEYBOARD_PKG"; then
@@ -541,6 +590,28 @@ download_reel() {
   rclone copyto "${MEGA_REMOTE}:${MEGA_REELS_SRC}/${name}" "$dest" --retries 5 -q || return 1
   [[ -s "$dest" ]] || return 1
   echo "$dest"
+}
+
+# Re-encodes a clip to something the emulator's software decoder can always play:
+# H.264 Main profile, yuv420p, 30 fps constant, max 720 px wide (even dimensions), AAC stereo.
+# Prints the path of the new file. The output is named <original-name>.mp4 inside a sub-folder so
+# the file name on the device stays identical to the one in Mega.
+reencode_reel() {
+  local in="$1" dir base out
+  dir="$(dirname "$in")/enc"; base="$(basename "$in")"; base="${base%.*}.mp4"
+  mkdir -p "$dir"; out="${dir}/${base}"
+  if ! command -v ffmpeg >/dev/null 2>&1; then
+    log "installing ffmpeg"
+    sudo apt-get update -qq >/dev/null 2>&1
+    sudo apt-get install -y -qq ffmpeg >/dev/null 2>&1 || { log "WARNING: could not install ffmpeg"; return 1; }
+  fi
+  ffmpeg -y -loglevel error -i "$in" \
+    -vf "scale='min(720,iw)':-2,fps=30,format=yuv420p" \
+    -c:v libx264 -profile:v main -level 3.1 -preset veryfast -crf 23 \
+    -c:a aac -b:a 128k -ar 44100 -ac 2 \
+    -movflags +faststart "$out" </dev/null || return 1
+  [[ -s "$out" ]] || return 1
+  echo "$out"
 }
 
 # Pushes the video to the device and triggers a media scan so the gallery picker can see it.
@@ -601,8 +672,11 @@ PY
 }
 
 # Full composer flow for one reel: + -> Reel -> pick video -> Next* -> caption -> Share.
-# Return codes: 0 = shared OK, 1 = this video failed (retryable, left in MEGA_REELS_SRC),
-# 2 = a structural step failed (same for every video, so the caller stops the whole loop).
+# Return codes:
+#   0 = shared OK
+#   1 = this video failed (retryable, left in MEGA_REELS_SRC)
+#   2 = a structural step failed (same for every video, so the caller stops the whole loop)
+#   3 = Facebook could not play the video in the emulator (counts toward MAX_PLAYBACK_FAILS)
 compose_one_reel() {
   local idx="$1" caption="$2" xy ok=0 i
 
@@ -623,11 +697,17 @@ compose_one_reel() {
 
   xy="$(pick_single_video_thumb || true)"
   [[ -n "$xy" ]] || { log "ERROR: video thumbnail not found in the gallery grid (see r${idx}-01-create-reel-gallery.png)"; return 1; }
-  log "tap video thumbnail at $xy"; adb shell input tap $xy; sleep 6
+  log "tap video thumbnail at $xy"; adb shell input tap $xy; sleep 8
 
   # Picking the video opens the "Edit reel" screen (Audio/Text/Effects/Stickers/Save, -> Next)
   screenshot "r${idx}-02-edit-reel.png"; save_ui "r${idx}-edit-reel"
   log "texts in Edit reel:"; ui_texts | head -30 | sed 's/^/[fb]   /'
+
+  # Fail fast if the emulator could not decode the video
+  if grep -qiE "Couldn.t play video" "$UI_XML"; then
+    log "ERROR: Facebook could not play this video in the emulator (codec / GPU issue)"
+    return 3
+  fi
 
   xy="$(ui_find text '^Next$' 0 || true)"
   [[ -n "$xy" ]] || { log "ERROR: Next button not found on the Edit reel screen"; return 1; }
@@ -693,14 +773,23 @@ post_reels_flow() {
   fi
   log "found ${#pending[@]} video(s) in ${MEGA_REELS_SRC}, will post up to $count"
 
-  local posted=0 idx=0 name local_path remote_path rc
+  local posted=0 idx=0 playback_fails=0 name local_path enc remote_path rc
   for name in "${pending[@]}"; do
     (( posted >= count )) && break
     idx=$((idx+1))
-    log "=== reel $((posted+1))/$count: $name ==="
+    log "=== reel $((posted+1))/$count (file #$idx): $name ==="
 
     local_path="$(download_reel "$name" || true)"
     [[ -n "$local_path" ]] || { log "ERROR: could not download $name from Mega, skipping"; continue; }
+
+    if [[ "$REENCODE_REELS" == "1" ]]; then
+      if enc="$(reencode_reel "$local_path")" && [[ -n "$enc" ]]; then
+        rm -f "$local_path"; local_path="$enc"
+        log "re-encoded for the emulator: $(basename "$enc") ($(stat -c%s "$enc") bytes)"
+      else
+        log "WARNING: re-encode failed, using the original file (it may not play in the emulator)"
+      fi
+    fi
 
     remote_path="$(push_reel_to_device "$local_path" || true)"
     rm -f "$local_path"
@@ -709,7 +798,12 @@ post_reels_flow() {
     compose_one_reel "$idx" "$caption"; rc=$?
     remove_reel_from_device "$remote_path"
 
+    # Whatever happened, make sure the app is back on the plain feed before anything else, so a
+    # stale screen can never be mistaken for a structural failure or break the next video.
+    if [[ "$rc" != "0" ]]; then recover_to_feed; else return_to_feed; fi
+
     if [[ "$rc" == "0" ]]; then
+      playback_fails=0
       if rclone moveto "${MEGA_REMOTE}:${MEGA_REELS_SRC}/${name}" "${MEGA_REMOTE}:${MEGA_REELS_DONE}/${name}" --retries 5 -q; then
         log "moved $name to ${MEGA_REELS_DONE} (will not be reposted)"
       else
@@ -719,7 +813,15 @@ post_reels_flow() {
     elif [[ "$rc" == "2" ]]; then
       log "structural failure, stopping reel posting (see r${idx}-* artifacts)"
       break
+    elif [[ "$rc" == "3" ]]; then
+      playback_fails=$((playback_fails+1))
+      log "reel $name: playback error ($playback_fails/$MAX_PLAYBACK_FAILS), left in ${MEGA_REELS_SRC} for retry"
+      if (( playback_fails >= MAX_PLAYBACK_FAILS )); then
+        log "stopping: repeated playback errors point at the emulator (GPU/codec), not at one bad file"
+        break
+      fi
     else
+      playback_fails=0
       log "reel $name failed, left in ${MEGA_REELS_SRC} for retry"
     fi
   done
