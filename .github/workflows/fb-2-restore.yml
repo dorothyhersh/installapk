@@ -13,6 +13,21 @@ on:
         required: false
         type: boolean
         default: false
+      reel_count:
+        description: "How many reels to download and post (0 = skip reel posting)"
+        required: false
+        type: string
+        default: "3"
+      reels_src_folder:
+        description: "Mega folder to pull reel videos from"
+        required: false
+        type: string
+        default: "FB_Reels"
+      reels_done_folder:
+        description: "Mega folder posted reels are moved to (prevents re-posting)"
+        required: false
+        type: string
+        default: "FB_Reels2"
 
 jobs:
   restore:
@@ -42,6 +57,9 @@ jobs:
           RCLONE_CONF_CONTENT: ${{ secrets.RCLONE_CONF }}
           MEGA_FOLDER: facebook-android-backup
           MEGA_FILE: fb-session.tgz.enc
+          REEL_COUNT: ${{ inputs.reel_count }}
+          MEGA_REELS_SRC: ${{ inputs.reels_src_folder }}
+          MEGA_REELS_DONE: ${{ inputs.reels_done_folder }}
         with:
           api-level: 30
           target: google_apis
