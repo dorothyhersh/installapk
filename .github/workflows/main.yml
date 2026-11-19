@@ -1,0 +1,52 @@
+name: Run via my phone internet
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Baseline speed (normal GitHub runner, no phone)
+        run: |
+          echo "Public IP: $(curl -s https://ifconfig.me)"
+          head -c 10000000 /dev/urandom > /tmp/up.bin
+          DOWN=$(curl -s -o /dev/null --max-time 60 -w '%{speed_download}' "https://speed.cloudflare.com/__down?bytes=25000000")
+          UP=$(curl -s -o /dev/null --max-time 60 -w '%{speed_upload}' -X POST --data-binary @/tmp/up.bin "https://speed.cloudflare.com/__up")
+          echo "Baseline download: $(echo $DOWN | awk '{printf "%.2f", $1*8/1000000}') Mbps"
+          echo "Baseline upload:   $(echo $UP | awk '{printf "%.2f", $1*8/1000000}') Mbps"
+
+      - name: Route traffic through my phone
+        run: |
+          sudo tailscale set --exit-node=100.85.72.32 --exit-node-allow-lan-access=true
+          sleep 5
+          tailscale status
+
+      - name: Check connection to phone (direct or relay)
+        run: |
+          tailscale ping -c 4 100.85.72.32 || true
+          tailscale status | grep infinix || true
+
+      - name: Verify IP (should be your phone's mobile IP)
+        run: |
+          echo "Public IP now: $(curl -s --max-time 20 https://ifconfig.me)"
+
+      - name: Speed test through my phone
+        run: |
+          DOWN=$(curl -s -o /dev/null --max-time 90 -w '%{speed_download}' "https://speed.cloudflare.com/__down?bytes=25000000")
+          UP=$(curl -s -o /dev/null --max-time 90 -w '%{speed_upload}' -X POST --data-binary @/tmp/up.bin "https://speed.cloudflare.com/__up")
+          LAT=$(curl -s -o /dev/null --max-time 20 -w '%{time_starttransfer}' "https://speed.cloudflare.com/__down?bytes=0")
+          echo "Phone download: $(echo $DOWN | awk '{printf "%.2f", $1*8/1000000}') Mbps"
+          echo "Phone upload:   $(echo $UP | awk '{printf "%.2f", $1*8/1000000}') Mbps"
+          echo "Phone latency:  $(echo $LAT | awk '{printf "%.0f", $1*1000}') ms"
+
+      - name: Your actual job
+        run: |
+          curl -sI https://example.com | head -n 5
