@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       apk_url:
-        description: "Direct URL to a Facebook APK (must be a single .apk for x86_64)"
-        required: true
+        description: "Direct URL to the APK/zip (leave empty to use the zip in Mega)"
+        required: false
         type: string
       package_name:
         description: "Package name"
@@ -33,6 +33,7 @@ jobs:
           MODE: login
           APK_URL: ${{ inputs.apk_url }}
           PACKAGE_NAME: ${{ inputs.package_name }}
+          APK_MEGA_FILE: facebook-apk/facebook.zip
           MAKE_BACKUP: "1"
           FB_IDENTIFIER: ${{ secrets.FB_IDENTIFIER }}
           FB_PASSWORD: ${{ secrets.FB_PASSWORD }}
