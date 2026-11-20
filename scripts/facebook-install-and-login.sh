@@ -1077,6 +1077,10 @@ restore_flow() {
   return 1
 }
 
+# ---- Caption / Share-now fixes (overrides setup_adb_keyboard, adb_type_unicode, compose_one_reel) ----
+# caption-helpers.sh must sit in the same folder as this script (scripts/).
+source "$(dirname "${BASH_SOURCE[0]}")/caption-helpers.sh"
+
 # ===================== MAIN =====================
 log "mode: $MODE"
 
