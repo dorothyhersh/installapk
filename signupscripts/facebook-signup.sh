@@ -22,7 +22,8 @@ FB_BIRTHDAY="${FB_BIRTHDAY:-2002-05-17}"; FB_GENDER="${FB_GENDER:-male}"
 FB_EMAIL="${FB_EMAIL:-}"; FB_PASSWORD="${FB_PASSWORD:-}"
 MAKE_BACKUP="${MAKE_BACKUP:-1}"
 BACKUP_PASSPHRASE="${BACKUP_PASSPHRASE:-}"
-CODE_WAIT="${CODE_WAIT:-300}"
+CODE_WAIT="${CODE_WAIT:-120}"
+CODE_ATTEMPTS="${CODE_ATTEMPTS:-4}"
 
 RCLONE_CONF_CONTENT="${RCLONE_CONF_CONTENT:-}"
 RCLONE_CFG="${HOME}/.config/rclone/rclone.conf"
@@ -446,6 +447,106 @@ reach_name_screen() {
   return 1
 }
 
+
+rand_wait() {  # rand_wait <min> <max> <why>
+  local t=$(( $1 + RANDOM % ($2 - $1 + 1) ))
+  log "waiting ${t}s ($3)"; sleep "$t"
+}
+
+# digits currently inside the first text field on screen
+field_digits() {
+  python3 - "$UI_XML" <<'PY'
+import re,sys,xml.etree.ElementTree as ET
+for n in ET.parse(sys.argv[1]).getroot().iter('node'):
+    if 'EditText' in n.attrib.get('class',''):
+        print(re.sub(r'\D','',n.attrib.get('text',''))); break
+PY
+}
+
+# the "Do you need help?" bottom sheet can pop up over the code screen: close it
+close_help_sheet() {
+  ui_dump || return 0
+  grep -qi "Do you need help" "$UI_XML" || return 0
+  local xy; xy="$(ui_query text '^(Dismiss|Close)$' 0 || true)"
+  [[ -n "$xy" ]] && { log "closing the help sheet at $xy"; adb shell input tap $xy; sleep 2; }
+  return 0
+}
+
+# Type the code one key at a time with key events (adb "input text" duplicated a digit once: 903004),
+# then READ the field back and retry until it holds exactly the code.
+enter_code() {
+  local code="$1" t d got
+  for t in 1 2 3; do
+    close_help_sheet
+    tap_field 0 || return 1; sleep 1
+    adb shell "input keyevent 123; for i in 1 2 3 4 5 6 7 8 9 10 11 12; do input keyevent 67; done" >/dev/null 2>&1
+    sleep 1
+    for ((d=0; d<${#code}; d++)); do adb shell input keyevent $((7 + ${code:d:1})) >/dev/null 2>&1; sleep 0.5; done
+    sleep 1
+    ui_dump && got="$(field_digits)" || got=""
+    if [[ "$got" == "$code" ]]; then log "code typed and verified in the field"; screenshot "10-code-entered-$t.png"; return 0; fi
+    log "typed code mismatch (field has ${#got} digits, expected ${#code}), clearing and retrying ($t/3)"
+    screenshot "10-code-mismatch-$t.png"
+  done
+  return 1
+}
+
+# tap Next / OK / Continue, whichever is on screen; otherwise press Enter on the keyboard
+submit_code() {
+  local xy
+  ui_dump || true
+  xy="$(ui_query text '^(Next|OK|Continue|Confirm|Done)$' 0 || true)"
+  if [[ -n "$xy" ]]; then log "submit: tapping button at $xy"; adb shell input tap $xy
+  else log "submit: no button found, pressing Enter"; adb shell input keyevent 66; fi
+}
+
+# sets CODE_RESULT = ok | bad | timeout
+wait_code_result() {
+  local i; CODE_RESULT=timeout
+  for ((i=0; i<15; i++)); do
+    sleep 3
+    ui_dump || continue
+    if grep -qiE "Do you need help|incorrect|invalid|doesn.t match|isn.t right|wrong code" "$UI_XML"; then CODE_RESULT=bad; return; fi
+    if ! grep -qiE "confirmation code|Resend" "$UI_XML"; then CODE_RESULT=ok; return; fi
+  done
+}
+
+# "I didn't get the code" -> "Resend confirmation code"
+resend_code() {
+  ui_dump || true
+  if ! grep -qi "Resend confirmation code" "$UI_XML"; then
+    tap_text "^I didn.t get the code" "" 4 || log "WARNING: 'I didn't get the code' not found"
+    sleep 3
+  fi
+  tap_text '^Resend confirmation code$' "" 5 || { log "WARNING: resend button not found"; return 1; }
+  sleep 4; screenshot "10-resend-tapped.png"
+  close_help_sheet
+}
+
+confirm_with_code() {
+  local since="$1" attempt code
+  for ((attempt=1; attempt<=CODE_ATTEMPTS; attempt++)); do
+    if (( attempt > 1 )); then
+      log "attempt $attempt/$CODE_ATTEMPTS: asking Facebook to resend the code"
+      resend_code || true
+      since="$(date +%s)"
+      rand_wait 6 12 "after resend"
+    fi
+    code="$(fetch_code "$since")" || { log "attempt $attempt: no code arrived within ${CODE_WAIT}s"; continue; }
+    log "attempt $attempt: got a ${#code}-digit code"
+    enter_code "$code" || { log "attempt $attempt: could not get the code into the field"; continue; }
+    submit_code
+    wait_code_result
+    case "$CODE_RESULT" in
+      ok)  log "confirmation code accepted"; screenshot "10b-code-accepted.png"; return 0 ;;
+      bad) log "attempt $attempt: Facebook did not accept the code" ;;
+      *)   log "attempt $attempt: timed out waiting for the result" ;;
+    esac
+    screenshot "10c-attempt-$attempt-failed.png"
+  done
+  return 1
+}
+
 # ---------------- The signup ----------------
 signup_flow() {
   local missing=""
@@ -498,11 +599,12 @@ signup_flow() {
   local since; since="$(date +%s)"
   ip_guard || return 1          # re-check the IP right before the account is actually created
   tap_text '^I agree$' "" 6 || return 1
-  sleep 10; screenshot "08-after-agree.png"
+  rand_wait 6 12 "after tapping I agree"
+  screenshot "08-after-agree.png"
 
-  # 9) wait for the confirmation-code screen (or a block)
+  # 9) wait until the confirmation-code screen is really on screen (or a block shows up)
   local i got=0
-  for ((i=0; i<30; i++)); do
+  for ((i=0; i<45; i++)); do
     dismiss_perm
     ui_dump && grep -qiE "confirmation code" "$UI_XML" && { got=1; break; }
     die_if_blocked "after-agree"
@@ -510,18 +612,12 @@ signup_flow() {
   done
   [[ "$got" == "1" ]] || { screenshot "err-no-code-screen.png"; save_ui "no-code-screen"; log "ERROR: confirmation-code screen not reached"; return 1; }
   screenshot "09-code-screen.png"
+  rand_wait 6 12 "on the confirmation-code screen"
 
-  local code; code="$(fetch_code "$since")" || { log "ERROR: no confirmation code received in ${CODE_WAIT}s (use 'I didn't get the code' manually / check Gmail)"; return 1; }
-  log "got a 5-digit code (not printed)"
-  tap_field 0 || return 1; sleep 1; type_text "$code"
-  screenshot "10-code-entered.png"; next_btn || return 1
-  sleep 10
-
-  # 10) confirmation accepted? then skip onboarding prompts
+  # 10) get the code, type it, verify the field, submit; resend + retry if it is not accepted
+  confirm_with_code "$since" || { screenshot "err-code-failed.png"; save_ui "code-failed"; log "ERROR: confirmation code was not accepted after $CODE_ATTEMPTS attempts"; return 1; }
   die_if_blocked "after-code"
-  if ui_dump && grep -qiE "confirmation code" "$UI_XML" && grep -qiE "incorrect|invalid|wrong|doesn.t match" "$UI_XML"; then
-    screenshot "err-bad-code.png"; log "ERROR: Facebook rejected the code"; return 1
-  fi
+
   tap_text '^(Save|OK)$' "" 1 || true
   post_login_prompts 12 || true
   screenshot "11-after-onboarding.png"; save_ui "final"
