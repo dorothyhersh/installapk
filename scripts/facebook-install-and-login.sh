@@ -643,21 +643,51 @@ reencode_reel() {
 # Pushes the video to the device and triggers a media scan so the gallery picker can see it.
 # Each reel is pushed, posted and deleted before the next one, so at most one video ever sits
 # on the device at a time - the picker never has to tell two videos apart.
+# The on-device file name is SANITISED (letters, digits, . _ - only). Names such as
+# "FDownloader.Net_..._720p_(HD).mp4" contain "(" and ")", which the device shell treats as syntax,
+# so the media-scan broadcast silently failed and Facebook showed "No photos on this device".
+safe_device_name() {
+  local n ext stem; n="$(basename "$1")"
+  ext="${n##*.}"; stem="${n%.*}"
+  [[ "$n" == *.* ]] || { ext="mp4"; stem="$n"; }
+  ext="${ext//[^A-Za-z0-9]/}"; [[ -n "$ext" ]] || ext="mp4"
+  stem="${stem//[^A-Za-z0-9._-]/_}"
+  stem="${stem:0:50}"
+  printf 'reel_%s.%s' "$stem" "$ext"
+}
+
+media_scan() {
+  local remote_path="$1"
+  adb shell "am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d 'file://${remote_path}'" >/dev/null 2>&1
+}
+
+# True when MediaStore already lists the file (so the Facebook gallery will show it)
+media_indexed() {
+  local safe="$1"
+  adb shell "content query --uri content://media/external/video/media --projection _display_name" 2>/dev/null \
+    | tr -d '\r' | grep -qF "$safe"
+}
+
 push_reel_to_device() {
-  local local_path="$1" name remote_path
-  name="$(basename "$local_path")"
-  remote_path="/sdcard/Movies/${name}"
+  local local_path="$1" safe remote_path i
+  safe="$(safe_device_name "$local_path")"
+  remote_path="/sdcard/Movies/${safe}"
+  adb shell "mkdir -p /sdcard/Movies" >/dev/null 2>&1
   adb push "$local_path" "$remote_path" >/dev/null 2>&1 || return 1
-  adb shell am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d "file://${remote_path}" >/dev/null 2>&1
-  sleep 3
+  for i in 1 2 3 4 5; do
+    media_scan "$remote_path"
+    sleep 3
+    if media_indexed "$safe"; then log "video indexed by the device gallery: $safe" >&2; echo "$remote_path"; return 0; fi
+  done
+  log "WARNING: could not confirm the gallery indexed $safe, continuing anyway" >&2
   echo "$remote_path"
 }
 
 remove_reel_from_device() {
   local remote_path="$1"
   [[ -n "$remote_path" ]] || return 0
-  adb shell rm -f "$remote_path" >/dev/null 2>&1
-  adb shell am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d "file://${remote_path}" >/dev/null 2>&1
+  adb shell "rm -f '${remote_path}'" >/dev/null 2>&1
+  media_scan "$remote_path"
 }
 
 # In the media picker, finds the one video thumbnail: first by its duration badge (e.g. "0:12"),
@@ -758,6 +788,12 @@ compose_one_reel() {
   log "texts in Create reel / gallery:"; ui_texts | head -30 | sed 's/^/[fb]   /'
 
   xy="$(pick_single_video_thumb || true)"
+  for i in 1 2 3; do
+    [[ -n "$xy" ]] && break
+    log "no video in the gallery yet (try $i/3)$(grep -qi 'No photos on this device' "$UI_XML" && echo ': gallery says No photos on this device'), waiting"
+    sleep 6; ui_dump || true
+    xy="$(pick_single_video_thumb || true)"
+  done
   [[ -n "$xy" ]] || { log "ERROR: video thumbnail not found in the gallery grid (see r${idx}-01-create-reel-gallery.png)"; return 1; }
   log "tap video thumbnail at $xy"; adb shell input tap $xy; sleep 2
 
