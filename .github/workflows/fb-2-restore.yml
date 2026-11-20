@@ -66,14 +66,39 @@ jobs:
           rclone version | head -1
           rclone help backends | grep -i mega
 
-      # Used to re-encode reel videos so the emulator's software decoder can play them.
-      - name: Install ffmpeg
+      # ffmpeg (only needed for re-encoding). A static build is ~10 s to fetch and is cached, versus
+      # several minutes for `apt-get update && apt-get install ffmpeg` (which pulls 100+ packages).
+      # Skipped completely when reencode_reels = 0.
+      - name: Cache static ffmpeg
+        id: ffcache
+        if: inputs.reencode_reels != '0'
+        uses: actions/cache@v4
+        with:
+          path: ~/ffmpeg-bin
+          key: ffmpeg-static-amd64-v1
+
+      - name: Install ffmpeg (static build)
+        if: inputs.reencode_reels != '0'
         run: |
-          if ! command -v ffmpeg >/dev/null 2>&1; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq ffmpeg
+          if [ ! -x "$HOME/ffmpeg-bin/ffmpeg" ]; then
+            mkdir -p "$HOME/ffmpeg-bin" /tmp/ffdl
+            ok=0
+            for i in 1 2 3; do
+              if curl -fSL --retry 2 --connect-timeout 15 --max-time 120 \
+                   -o /tmp/ffdl/ff.tar.xz https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
+                 && tar -xJf /tmp/ffdl/ff.tar.xz -C /tmp/ffdl; then ok=1; break; fi
+              echo "ffmpeg static download failed (attempt $i)"; sleep 3
+            done
+            if [ "$ok" = "1" ]; then
+              cp "$(find /tmp/ffdl -type f -name ffmpeg | head -1)" "$HOME/ffmpeg-bin/ffmpeg"
+              chmod +x "$HOME/ffmpeg-bin/ffmpeg"
+            else
+              echo "static ffmpeg unavailable, falling back to apt (slower)"
+              sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg || true
+            fi
           fi
-          ffmpeg -version | head -1
+          if [ -x "$HOME/ffmpeg-bin/ffmpeg" ]; then sudo install -m 0755 "$HOME/ffmpeg-bin/ffmpeg" /usr/local/bin/ffmpeg; fi
+          ffmpeg -version | head -1 || echo "WARNING: ffmpeg not available, reels will be posted without re-encoding"
 
       - name: Enable KVM
         run: |
