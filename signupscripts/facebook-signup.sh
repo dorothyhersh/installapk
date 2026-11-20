@@ -408,12 +408,12 @@ set_birthday() {
 fetch_code() {
   local code="" since="$1"
   if [[ -n "${GMAIL_APP_PASSWORD:-}" ]]; then
-    log "reading the confirmation code from Gmail (IMAP) for up to ${CODE_WAIT}s"
+    log "reading the confirmation code from Gmail (IMAP) for up to ${CODE_WAIT}s" >&2
     code="$(GMAIL_ADDRESS="$FB_EMAIL" SINCE_EPOCH="$since" CODE_WAIT="$CODE_WAIT" \
             python3 "${ROOT}/signupscripts/fetch-code.py" 2>>"$ARTIFACTS/imap.err")" || code=""
   else
-    log "no GMAIL_APP_PASSWORD: waiting for a code file in Mega at ${MEGA_REMOTE}:${CODE_MEGA_PATH} (up to ${CODE_WAIT}s)"
-    setup_rclone || return 1
+    log "no GMAIL_APP_PASSWORD: waiting for a code file in Mega at ${MEGA_REMOTE}:${CODE_MEGA_PATH} (up to ${CODE_WAIT}s)" >&2
+    setup_rclone >&2 || return 1
     rclone deletefile "${MEGA_REMOTE}:${CODE_MEGA_PATH}" 2>/dev/null || true
     local end=$((SECONDS+CODE_WAIT))
     while (( SECONDS < end )); do
@@ -532,7 +532,8 @@ confirm_with_code() {
       since="$(date +%s)"
       rand_wait 6 12 "after resend"
     fi
-    code="$(fetch_code "$since")" || { log "attempt $attempt: no code arrived within ${CODE_WAIT}s"; continue; }
+    code="$(fetch_code "$since" | grep -oE '[0-9]{5}' | tail -n 1)"
+    [[ "$code" =~ ^[0-9]{5}$ ]] || { log "attempt $attempt: no code arrived within ${CODE_WAIT}s"; continue; }
     log "attempt $attempt: got a ${#code}-digit code"
     enter_code "$code" || { log "attempt $attempt: could not get the code into the field"; continue; }
     submit_code
