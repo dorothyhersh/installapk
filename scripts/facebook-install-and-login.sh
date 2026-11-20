@@ -189,7 +189,7 @@ mega_download() {
 ui_dump() {
   local i
   for i in 1 2 3; do
-    if adb shell uiautomator dump /sdcard/ui.xml 2>&1 | grep -q "dumped to"; then
+    if timeout 20 adb shell uiautomator dump /sdcard/ui.xml 2>&1 | grep -q "dumped to"; then
       adb pull /sdcard/ui.xml "$UI_XML" >/dev/null 2>&1 && return 0
     fi
     sleep 1
@@ -221,6 +221,32 @@ elif len(hits) > idx:
 PY
 }
 ui_find() { ui_dump || return 1; ui_query "$@"; }
+
+# Single-attempt dump with a hard timeout. uiautomator cannot dump while the screen is "busy":
+# the Edit reel screen plays the video and its progress bar fires accessibility events all the time,
+# so `uiautomator dump` never sees an idle UI and hangs / fails ("could not get idle state").
+# The old ui_dump retried 3x without a timeout, so that screen looked like a silent hang.
+ui_dump_fast() {
+  local out
+  out="$(timeout 15 adb shell uiautomator dump /sdcard/ui.xml 2>&1 | tr -d '\r')"
+  if grep -q "dumped to" <<<"$out"; then
+    adb pull /sdcard/ui.xml "$UI_XML" >/dev/null 2>&1 && return 0
+  fi
+  log "ui dump failed (screen busy, e.g. video playing): $(printf '%s' "$out" | head -c 120 | tr '\n' ' ')"
+  return 1
+}
+
+# Taps the blue Next button by position (works even when uiautomator cannot dump the screen).
+# Position is computed from the real screen size: Next circle is at ~92% x, ~88% y.
+blind_tap_next() {
+  local sz w h x y
+  sz="$(adb shell wm size 2>/dev/null | tr -d '\r' | grep -oE '[0-9]+x[0-9]+' | tail -1)"
+  w="${sz%x*}"; h="${sz#*x}"
+  [[ "$w" =~ ^[0-9]+$ && "$h" =~ ^[0-9]+$ ]] || { w=1080; h=2400; }
+  x=$(( w * 922 / 1000 )); y=$(( h * 880 / 1000 ))
+  log "blind tap on Next at $x $y (screen ${w}x${h})"
+  adb shell input tap $x $y
+}
 
 tap_text() {
   local pat="$1" fallback="${2:-}" tries="${3:-5}" mode="${4:-text}" xy="" i
@@ -739,14 +765,29 @@ dismiss_play_error() {
   return 0
 }
 
-# On the "Edit reel" screen: wait for the gallery tap to open it, dismiss any "Couldn't play video"
-# dialog (as many times as it shows up) and tap Next. Never plays the video.
+# On the "Edit reel" screen: dismiss any "Couldn't play video" dialog (as many times as it shows up)
+# and tap Next. Never plays the video.
+# When the video DOES play, uiautomator cannot dump the screen (see ui_dump_fast), so after 2 failed
+# dumps in a row we tap Next by position instead, and keep verifying afterwards.
 # Returns 0 = Next tapped, 1 = Next never appeared, 3 = Next never appeared and the play error was seen.
 advance_past_edit_screen() {
-  local idx="$1" i xy seen_err=0
-  for ((i=0; i<30; i++)); do
-    ui_dump || { sleep 2; continue; }
+  local idx="$1" xy seen_err=0 dump_fails=0 blind=0 logged=0 deadline=$(( SECONDS + 150 ))
+  while (( SECONDS < deadline )); do
+    if ! ui_dump_fast; then
+      dump_fails=$((dump_fails+1))
+      if (( dump_fails >= 2 && blind < 3 )); then
+        screenshot "r${idx}-02d-before-blind-next-${blind}.png"
+        blind_tap_next; blind=$((blind+1)); sleep 4
+        screenshot "r${idx}-02e-after-blind-next-${blind}.png"
+        log "focus after blind tap: $(focus_line)"
+        dump_fails=0
+      fi
+      sleep 1; continue
+    fi
+    dump_fails=0
+    if (( ! logged )); then log "texts on the edit screen:"; ui_texts | head -15 | sed 's/^/[fb]   /'; logged=1; fi
     if dismiss_play_error; then seen_err=1; continue; fi
+    if grep -qi 'Describe your reel' "$UI_XML"; then log "already on Reel Settings"; return 0; fi
     xy="$(ui_query text '^Next$' 0 || true)"
     if [[ -n "$xy" ]]; then
       if (( seen_err )); then screenshot "r${idx}-02b-after-dialog.png"; fi
@@ -754,10 +795,14 @@ advance_past_edit_screen() {
       adb shell input tap $xy; sleep 4
       return 0
     fi
+    if (( blind > 0 )); then
+      log "dump works again and no Next on screen: the blind tap on Next was accepted"
+      return 0
+    fi
     sleep 2
   done
-  screenshot "r${idx}-02c-no-next.png"; save_ui "r${idx}-no-next"
-  log "ERROR: Next button not found on the Edit reel screen"
+  screenshot "r${idx}-02c-no-next.png"
+  log "ERROR: could not tap Next on the Edit reel screen"
   if (( seen_err )); then return 3; fi
   return 1
 }
@@ -799,14 +844,16 @@ compose_one_reel() {
   # Picking the video opens the "Edit reel" screen. The emulator usually cannot play the preview and
   # Facebook shows "Couldn't play video": dismiss it with OK and go straight to Next.
   sleep 3
-  screenshot "r${idx}-02-edit-reel.png"; save_ui "r${idx}-edit-reel"
+  screenshot "r${idx}-02-edit-reel.png"
+  # NOT save_ui here: a plain dump hangs while the video plays (see ui_dump_fast)
+  if ui_dump_fast; then cp "$UI_XML" "$ARTIFACTS/ui-r${idx}-edit-reel.xml" 2>/dev/null || true; fi
   advance_past_edit_screen "$idx"; rc=$?
   (( rc == 0 )) || return "$rc"
 
   # Wait for "Reel Settings". On the way: dismiss any playback-error dialog again, and step through
   # an extra Next screen if there is one.
   for i in $(seq 1 15); do
-    ui_dump || { sleep 2; continue; }
+    ui_dump_fast || { sleep 2; continue; }
     grep -qi 'Describe your reel' "$UI_XML" && break
     if dismiss_play_error; then continue; fi
     xy="$(ui_query text '^Next$' 0 || true)"
@@ -836,7 +883,7 @@ compose_one_reel() {
   # Upload+share can take a while; poll until the composer closes
   for i in $(seq 1 24); do
     sleep 5
-    ui_dump || continue
+    ui_dump_fast || continue
     if ! grep -qiE 'describe your reel|share now' "$UI_XML" && grep -qiE 'Home|Menu|Notifications' "$UI_XML"; then
       ok=1; break
     fi
