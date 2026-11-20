@@ -575,10 +575,14 @@ signup_flow() {
   set_birthday || return 1
   screenshot "04d-birthday.png"; next_btn || return 1
 
-  # 4) gender
-  wait_text "What.s your gender" 10 || { screenshot "err-gender.png"; return 1; }
-  if [[ "$FB_GENDER" == "male" ]]; then tap_text '^Male$' "" 5; else tap_text '^Female$' "" 5; fi
-  sleep 1; screenshot "05-gender.png"; next_btn || return 1
+  # 4) gender (Facebook sometimes skips this screen and goes straight to the mobile number screen)
+  wait_text "What.s your gender|What.s your mobile number" 12 || { screenshot "err-gender.png"; save_ui "err-gender"; return 1; }
+  if grep -qiE "What.s your gender" "$UI_XML"; then
+    if [[ "$FB_GENDER" == "male" ]]; then tap_text '^Male$' "" 5; else tap_text '^Female$' "" 5; fi
+    sleep 1; screenshot "05-gender.png"; next_btn || return 1
+  else
+    log "gender screen was skipped by Facebook, continuing"
+  fi
 
   # 5) mobile number screen -> "Sign up with email"
   wait_text "mobile number" 10 || { screenshot "err-mobile.png"; return 1; }
