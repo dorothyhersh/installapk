@@ -627,9 +627,8 @@ reencode_reel() {
   dir="$(dirname "$in")/enc"; base="$(basename "$in")"; base="${base%.*}.mp4"
   mkdir -p "$dir"; out="${dir}/${base}"
   if ! command -v ffmpeg >/dev/null 2>&1; then
-    log "installing ffmpeg"
-    sudo apt-get update -qq >/dev/null 2>&1
-    sudo apt-get install -y -qq ffmpeg >/dev/null 2>&1 || { log "WARNING: could not install ffmpeg"; return 1; }
+    log "WARNING: ffmpeg is not installed (the workflow installs it), skipping re-encode"
+    return 1
   fi
   ffmpeg -y -loglevel error -i "$in" \
     -vf "scale='min(720,iw)':-2,fps=30,format=yuv420p" \
