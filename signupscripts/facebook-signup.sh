@@ -426,6 +426,26 @@ fetch_code() {
   printf '%s' "$code"
 }
 
+
+# Keeps looking at the current UI and taps the right entry button until "What's your name" shows.
+reach_name_screen() {
+  local end=$((SECONDS+${ENTRY_TIMEOUT:-300})) xy last=""
+  while (( SECONDS < end )); do
+    dismiss_perm
+    if ! ui_dump; then sleep 3; continue; fi
+    if grep -qiE "What.s your name|First name" "$UI_XML"; then log "name screen reached"; return 0; fi
+    die_if_blocked "entry"
+    xy="$(ui_query text '^Get started$' 0 || true)"
+    if [[ -n "$xy" ]]; then log "entry: 'Get started' -> tap $xy"; adb shell input tap $xy; sleep 5; continue; fi
+    xy="$(ui_query text '^(Create new (Facebook )?account|Join Facebook|Sign up)$' 0 || true)"
+    if [[ -n "$xy" ]]; then log "entry: 'Create new account' -> tap $xy"; adb shell input tap $xy; sleep 6; continue; fi
+    xy="$(ui_query text '^(Continue|Next)$' 0 || true)"
+    if [[ -n "$xy" && "$last" != "cont" ]]; then log "entry: '$(echo continue)' -> tap $xy"; adb shell input tap $xy; last=cont; sleep 5; continue; fi
+    log "entry: nothing to tap yet (loading?), waiting"; sleep 3
+  done
+  return 1
+}
+
 # ---------------- The signup ----------------
 signup_flow() {
   local missing=""
@@ -436,16 +456,14 @@ signup_flow() {
   ip_guard || return 1
   dismiss_system_dialogs; sleep 5
 
-  # 1) entry screen(s): account switcher / login page -> "Create new account" -> "Get started"
+  # 1) entry screens vary (login page / account switcher / "Get started" / Meta Account page that
+  #    again shows "Create new account"). Look at the CURRENT screen each time and tap what is there
+  #    until the name screen appears.
   screenshot "03-start.png"
-  tap_text '^(Create new (Facebook )?account|Join Facebook)' "" 8 || true
-  sleep 3
-  tap_text '^Get started$' "" 6 || true
-  sleep 3; dismiss_perm
-  screenshot "03b-after-get-started.png"
+  reach_name_screen || { screenshot "err-name.png"; save_ui "err-name"; log "ERROR: name screen not reached"; return 1; }
+  screenshot "03b-name-screen.png"
 
   # 2) name
-  wait_text "What.s your name" 12 || { screenshot "err-name.png"; save_ui "err-name"; log "ERROR: name screen not reached"; return 1; }
   tap_field 0 || return 1; sleep 1; type_text "$FB_FIRST_NAME"
   tap_field 1 || return 1; sleep 1; type_text "$FB_LAST_NAME"
   screenshot "04-name.png"; next_btn || return 1
