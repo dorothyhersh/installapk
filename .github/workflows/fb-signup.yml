@@ -1,0 +1,132 @@
+name: FB - Sign up NEW account (Telenor IP or GitHub runner IP)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ip_mode:
+        description: "telenor = your phone exit node | runner = GitHub runner IP | auto = try Telenor, fall back to runner"
+        required: true
+        type: choice
+        default: auto
+        options: [auto, telenor, runner]
+      email:
+        description: "Email for the new account"
+        required: true
+        type: string
+        default: "shahnawasali21@gmail.com"
+      first_name:
+        description: "First name"
+        required: true
+        type: string
+      last_name:
+        description: "Last name"
+        required: true
+        type: string
+      birthday:
+        description: "Birthday YYYY-MM-DD"
+        required: true
+        type: string
+        default: "2002-05-17"
+      gender:
+        description: "Gender"
+        required: true
+        type: choice
+        default: male
+        options: [male, female]
+      apk_url:
+        description: "Direct URL to the APK/zip (empty = use the zip in Mega)"
+        required: false
+        type: string
+      make_backup:
+        description: "Encrypted session backup to Mega after signup"
+        required: false
+        type: boolean
+        default: true
+
+env:
+  PHONE_IP: 100.85.72.32
+
+jobs:
+  signup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Not needed in runner mode. In auto mode a failure here just means "use the runner IP".
+      - name: Connect to Tailscale
+        if: ${{ inputs.ip_mode != 'runner' }}
+        continue-on-error: ${{ inputs.ip_mode == 'auto' }}
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Record baseline IP (runner's own IP)
+        run: echo "BASELINE_IP=$(curl -s --max-time 20 https://ifconfig.me)" | tee -a $GITHUB_ENV
+
+      # Downloaded on the runner internet, before the emulator starts and before any exit node.
+      - name: Download Facebook APK/zip
+        env:
+          BASELINE_IP: ${{ env.BASELINE_IP }}
+          APK_URL: ${{ inputs.apk_url }}
+          APK_MEGA_FILE: facebook-apk/facebook.zip
+          RCLONE_CONF_CONTENT: ${{ secrets.RCLONE_CONF }}
+        run: timeout 1000 bash signupscripts/download-apk.sh
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Emulator -> choose IP -> sign up
+        uses: reactivecircus/android-emulator-runner@v2
+        env:
+          IP_MODE: ${{ inputs.ip_mode }}
+          PHONE_IP: ${{ env.PHONE_IP }}
+          BASELINE_IP: ${{ env.BASELINE_IP }}
+          EXPECTED_PHONE_IP: ${{ secrets.EXPECTED_PHONE_IP }}
+          PACKAGE_NAME: com.facebook.katana
+          FB_EMAIL: ${{ inputs.email }}
+          FB_FIRST_NAME: ${{ inputs.first_name }}
+          FB_LAST_NAME: ${{ inputs.last_name }}
+          FB_BIRTHDAY: ${{ inputs.birthday }}
+          FB_GENDER: ${{ inputs.gender }}
+          FB_PASSWORD: ${{ secrets.FB_NEW_PASSWORD }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          MAKE_BACKUP: ${{ inputs.make_backup && '1' || '0' }}
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+          RCLONE_CONF_CONTENT: ${{ secrets.RCLONE_CONF }}
+        with:
+          api-level: 30
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          cores: 2
+          ram-size: 3072M
+          force-avd-creation: true
+          emulator-boot-timeout: 600
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -no-metrics
+          disable-animations: true
+          script: |
+            echo "emulator booted"
+            bash signupscripts/select-ip.sh
+            bash signupscripts/facebook-signup.sh
+
+      - name: Print logs
+        if: always()
+        run: |
+          echo "=== active IP mode ==="; cat "$RUNNER_TEMP/ip_mode_active" 2>/dev/null || echo unknown
+          echo "=== run.log ==="; cat artifacts/run.log 2>/dev/null || echo "no run.log"
+
+      - name: Upload screenshots and logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fb-signup-screenshots
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 3
